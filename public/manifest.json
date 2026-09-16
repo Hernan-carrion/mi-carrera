@@ -1,0 +1,13 @@
+{
+  "name": "Personal Tracker Dashboard",
+  "short_name": "Tracker",
+  "description": "Agenda personal con la metodologia de Brian Tracy y un tracker de habitos circular.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#fafafa",
+  "theme_color": "#171717",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

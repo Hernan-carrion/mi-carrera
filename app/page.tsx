@@ -211,6 +211,14 @@ export default function Home() {
   // --- La Ley del Tres ---
   const [threeGoals, setThreeGoals] = useLocalStorage<string[]>("tracker.goals", DEFAULT_GOALS);
 
+  function addGoal() {
+    setThreeGoals((prev) => [...prev, ""]);
+  }
+
+  function removeGoal(index: number) {
+    setThreeGoals((prev) => prev.filter((_, idx) => idx !== index));
+  }
+
   // --- Tracy Bot ---
   const [quoteIndex, setQuoteIndex] = useState(0);
   useEffect(() => {
@@ -330,18 +338,36 @@ export default function Home() {
 
         {/* ---------------- LEY DEL TRES ---------------- */}
         <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
-          <div className="mb-4">
-            <h2 className="font-serif text-lg font-semibold text-neutral-900">La Ley del Tres</h2>
-            <p className="text-xs text-neutral-500">
-              Los 3 macro-objetivos que aportan el 90% de tu valor a largo plazo.
-            </p>
+          <div className="mb-4 flex items-start justify-between gap-3">
+            <div>
+              <h2 className="font-serif text-lg font-semibold text-neutral-900">La Ley del Tres</h2>
+              <p className="text-xs text-neutral-500">
+                Los macro-objetivos que aportan el 90% de tu valor a largo plazo. Lo ideal son 3:
+                mas que eso y dejan de ser "macro".
+              </p>
+            </div>
+            <button
+              onClick={addGoal}
+              className="flex-shrink-0 rounded-full border border-neutral-200 px-3 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-50 active:bg-neutral-100"
+            >
+              + Agregar objetivo
+            </button>
           </div>
           <div className="grid gap-3 sm:grid-cols-3">
             {threeGoals.map((goal, i) => (
-              <div key={i} className="rounded-xl border border-neutral-200 bg-neutral-50 p-3">
-                <label className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
-                  Objetivo {i + 1}
-                </label>
+              <div key={i} className="relative rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
+                    Objetivo {i + 1}
+                  </label>
+                  <button
+                    onClick={() => removeGoal(i)}
+                    aria-label="Quitar objetivo"
+                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center text-base text-neutral-300 transition-colors hover:text-neutral-600"
+                  >
+                    &times;
+                  </button>
+                </div>
                 <textarea
                   value={goal}
                   rows={3}
@@ -349,10 +375,15 @@ export default function Home() {
                     const value = e.target.value;
                     setThreeGoals((prev) => prev.map((g, idx) => (idx === i ? value : g)));
                   }}
-                  className="mt-1 w-full resize-none rounded-md border-none bg-transparent text-sm text-neutral-800 focus:outline-none focus:ring-1 focus:ring-neutral-300"
+                  className="w-full resize-none rounded-md border-none bg-transparent text-sm text-neutral-800 focus:outline-none focus:ring-1 focus:ring-neutral-300"
                 />
               </div>
             ))}
+            {threeGoals.length === 0 && (
+              <p className="py-4 text-sm text-neutral-400 sm:col-span-3">
+                No hay objetivos. Agrega el primero.
+              </p>
+            )}
           </div>
         </section>
 

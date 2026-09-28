@@ -4,14 +4,14 @@ import "./globals.css";
 const basePath = process.env.NEXT_BASE_PATH || "";
 
 export const metadata: Metadata = {
-  title: "Personal Tracker Dashboard",
+  title: "Mi Carrera · Lic. en Cs. de la Computación",
   description:
-    "Dashboard de productividad personal con la metodologia de Brian Tracy y un tracker de habitos circular en SVG.",
+    "Seguimiento de la Licenciatura en Ciencias de la Computación (UNSJ) y su título intermedio TUP, con correlatividades automáticas.",
   manifest: `${basePath}/manifest.json`,
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "Tracker",
+    title: "Mi Carrera",
   },
 };
 

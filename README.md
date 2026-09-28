@@ -1,38 +1,29 @@
-# Personal Tracker Dashboard
+# Mi Carrera
 
-Agenda personal minimalista (Next.js + React + Tailwind CSS) que combina la
-metodologia de productividad de Brian Tracy con un tracker de habitos
-circular dibujado en SVG puro. Pensada para usarse como sitio web desde el
-celular, sin backend: todos los datos se guardan en el `localStorage` del
-navegador donde se abre.
+Seguimiento de la **Licenciatura en Ciencias de la Computacion** (UNSJ,
+plan Ord. 10/2022) y su titulo intermedio, la **Tecnicatura Universitaria
+en Programacion (TUP)**. Sitio estatico (Next.js + React + Tailwind CSS)
+pensado para usarse desde el celular, publicado en GitHub Pages.
 
 ## Funcionalidad
 
-- **Gestor ABCDE / Eat That Frog**: prioriza tareas de A a E; la tarea A1
-  se destaca arriba de todo como "Sapo del Dia".
-- **Regla del 10/90**: boton "Cierre de Dia" que abre un modal y obliga a
-  planificar (minimo 3 tareas, con al menos una A) antes de cerrar.
-- **La Ley del Tres**: panel para fijar los 3 macro-objetivos del momento.
-- **Tracy Bot**: rota automaticamente 4 consejos diarios.
-- **Tracker de habitos circular**: semicirculo concentrico en SVG, un
-  anillo por habito y 31 columnas angulares (dias del mes), calculado con
-  trigonometria (`Math.sin`/`Math.cos`). Cada mes arranca con su propia
-  grilla en blanco.
-- **Notas** con fondo de grilla sutil.
-- **Mi Carrera** (`/carrera`): seguimiento de la Lic. en Ciencias de la
-  Computacion (UNSJ, Ord. 10/2022) y su titulo intermedio TUP. Las materias
-  se habilitan/bloquean solas segun las correlatividades de la Res.
-  109/2022 (`app/carrera/plan.ts`): regularizar alcanza para cursar las
-  correlativas debiles, y el final solo se habilita con las correlativas
-  para rendir aprobadas. Estados: cursando → regular / promocional / libre,
-  carga de notas de cursada y finales (con aplazos), % de TUP y de
-  Licenciatura, y backup exportable a JSON. Opcionalmente se sincroniza
-  con Google Sheets (ver abajo).
+- **Correlatividades automaticas** segun la Res. 109/2022-CD-FCEFN
+  (`app/lib/plan.ts`): las materias se habilitan o bloquean solas.
+  Regularizar alcanza para cursar las correlativas debiles, y el final
+  solo se habilita con las correlativas para rendir aprobadas.
+- **Estados**: cursando → regular / promocional / libre / recursar. Una
+  materia a recursar queda bloqueada hasta el ciclo lectivo siguiente.
+- **Notas** de cursada y finales (con historial de aplazos), promedio con
+  y sin aplazos.
+- **Progreso**: % de TUP (prioridad, con la Practica Socio-Educativa) y %
+  de Licenciatura. Las materias de la TUP se destacan en otro color.
+- **Datos**: se guardan en el `localStorage` del navegador, con backup
+  exportable a JSON y sincronizacion opcional con Google Sheets.
 
-## Sincronizar "Mi Carrera" con Google Sheets
+## Sincronizar con Google Sheets
 
 Para no depender del `localStorage` (y tener los mismos datos en el
-celular y la compu), la seccion de carrera puede guardarse en un Google
+celular y la compu), los datos pueden guardarse en un Google
 Sheet propio a traves de un Apps Script:
 
 1. Crear un Google Sheet nuevo → **Extensiones → Apps Script**.
@@ -55,10 +46,6 @@ La URL y la clave se guardan solo en el navegador, nunca en el repo. Si
 se cambia el codigo del script hay que crear una **nueva version** de la
 implementacion (Implementar → Gestionar implementaciones) para que tome
 efecto.
-
-Todo el estado (tareas, objetivos, marcas del tracker, notas) persiste en
-`localStorage`, asi que sobrevive a cerrar la pestana o el navegador. Es
-por-dispositivo: no se sincroniza entre el celular y la compu.
 
 ## Uso local
 

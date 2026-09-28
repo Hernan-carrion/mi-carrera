@@ -1,766 +1,1144 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useLocalStorage } from "./lib/useLocalStorage";
+import { MATERIAS_BY_ID, Materia, NOTA_APROBACION, PLAN, TUP_IDS } from "./lib/plan";
+import { SyncConfig, SyncStatus, errorLegible, probarConexion, useSheetSync } from "./lib/sync";
 
 /* =========================================================================
- * TIPOS Y DATOS BASE
+ * ESTADO GUARDADO POR MATERIA
+ * Solo se guarda lo que carga el usuario (cursando / regular / libre /
+ * aprobada + notas). "Bloqueada" y "Disponible" se calculan siempre a
+ * partir de las correlatividades, nunca se guardan.
  * ========================================================================= */
 
-type Priority = "A" | "B" | "C" | "D" | "E";
+type Estado = "pendiente" | "cursando" | "regular" | "libre" | "recursar" | "aprobada";
+type Via = "final" | "promocion" | "libre";
 
-interface Task {
-  id: string;
-  text: string;
-  priority: Priority;
-  done: boolean;
+interface Intento {
+  fecha: string;
+  nota: number;
+  tipo: "regular" | "libre";
 }
 
-const uid = () =>
-  typeof crypto !== "undefined" && "randomUUID" in crypto
-    ? crypto.randomUUID()
-    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+interface MateriaState {
+  estado: Estado;
+  via?: Via;
+  notaCursada?: number;
+  notaFinal?: number;
+  fechaRegular?: string;
+  fechaAprobada?: string;
+  intentos: Intento[];
+  nombre?: string; // nombre elegido para las electivas
+  cicloRecursa?: number; // recursada: año lectivo desde el que se puede volver a cursar
+}
 
-const PRIORITY_ORDER: Record<Priority, number> = { A: 0, B: 1, C: 2, D: 3, E: 4 };
+interface CarreraData {
+  materias: Record<number, MateriaState>;
+  practica: boolean;
+  updatedAt?: number; // para resolver que version gana al sincronizar
+}
 
-const PRIORITY_META: Record<
-  Priority,
-  { label: string; hint: string; badge: string }
-> = {
-  A: { label: "Vital", hint: "Consecuencias graves si no se hace", badge: "bg-neutral-900 text-white" },
-  B: { label: "Importante", hint: "Consecuencias leves", badge: "bg-neutral-700 text-white" },
-  C: { label: "Agradable", hint: "Sin consecuencias", badge: "bg-neutral-300 text-neutral-800" },
-  D: { label: "Delegar", hint: "Puede hacerlo otra persona", badge: "bg-neutral-200 text-neutral-600" },
-  E: { label: "Eliminar", hint: "No aporta valor real", badge: "bg-neutral-100 text-neutral-400" },
+const EMPTY: CarreraData = { materias: {}, practica: false };
+const DEFAULT_STATE: MateriaState = { estado: "pendiente", intentos: [] };
+
+const hoy = () => new Date().toISOString().slice(0, 10);
+const anioActual = () => new Date().getFullYear();
+
+/* =========================================================================
+ * MOTOR DE CORRELATIVIDADES
+ * ========================================================================= */
+
+type Vista =
+  | "aprobada"
+  | "retenida" // aprobada/promocionada pero con correlativas para rendir sin aprobar
+  | "regular"
+  | "cursando"
+  | "libre"
+  | "recursar" // debe recursar y todavia no empezo el ciclo lectivo siguiente
+  | "disponible"
+  | "bloqueada";
+
+interface Info {
+  vista: Vista;
+  aprobada: boolean; // aprobacion efectiva (cuenta para % y correlativas)
+  regularizada: boolean; // sirve como correlativa "debil"
+  puedeCursar: boolean;
+  puedeRendir: boolean;
+  faltaCursar: string[]; // motivos por los que no se puede cursar
+  faltaRendir: number[]; // materias a aprobar antes de rendir
+  inconsistente: boolean; // se cargo avance sin cumplir correlativas
+}
+
+function calcular(data: CarreraData): Record<number, Info> {
+  const out: Record<number, Info> = {};
+  const st = (id: number) => data.materias[id] ?? DEFAULT_STATE;
+  // Las correlativas siempre tienen codigo menor, asi que recorrer en orden
+  // garantiza que ya estan calculadas.
+  for (const mat of PLAN) {
+    const s = st(mat.id);
+    const apr = (id: number) => out[id]?.aprobada ?? false;
+    const reg = (id: number) => out[id]?.regularizada ?? false;
+
+    const faltaCursar: string[] = [];
+    for (const c of mat.cursada) if (!reg(c)) faltaCursar.push(`Regularizar ${c} · ${nombre(data, c)}`);
+    for (const r of mat.rendida) if (!apr(r)) faltaCursar.push(`Aprobar ${r} · ${nombre(data, r)}`);
+    if (mat.requierePractica && !data.practica) faltaCursar.push("Cumplir la Práctica Socio-Educativa");
+    const faltaRendir = mat.rendir.filter((r) => !apr(r));
+
+    const puedeCursar = faltaCursar.length === 0;
+    const puedeRendir = faltaRendir.length === 0;
+    const aprobada = s.estado === "aprobada" && puedeRendir;
+    const regularizada = s.estado === "regular" || s.estado === "aprobada";
+
+    let vista: Vista;
+    if (s.estado === "aprobada") vista = aprobada ? "aprobada" : "retenida";
+    else if (s.estado === "pendiente") vista = puedeCursar ? "disponible" : "bloqueada";
+    else if (s.estado === "recursar")
+      vista = anioActual() < (s.cicloRecursa ?? 0) ? "recursar" : puedeCursar ? "disponible" : "bloqueada";
+    else vista = s.estado;
+
+    const inconsistente =
+      s.estado !== "pendiente" && !(s.estado === "aprobada" && s.via === "libre") && !puedeCursar;
+
+    out[mat.id] = { vista, aprobada, regularizada, puedeCursar, puedeRendir, faltaCursar, faltaRendir, inconsistente };
+  }
+  return out;
+}
+
+/** Texto del estado para mostrar (tarjeta, detalle y Google Sheets). */
+function etiqueta(s: MateriaState, i: Info) {
+  if (i.vista === "aprobada" && s.via === "promocion") return "Promocionada";
+  if (i.vista === "recursar") return `Recursar · desde ${s.cicloRecursa}`;
+  if (s.estado === "recursar") return `${VISTA_META[i.vista].label} · recursa`;
+  return VISTA_META[i.vista].label;
+}
+
+function nombre(data: CarreraData, id: number) {
+  const mat = MATERIAS_BY_ID[id];
+  const custom = data.materias[id]?.nombre?.trim();
+  return mat.electiva && custom ? `${mat.nombre}: ${custom}` : mat.nombre;
+}
+
+/* Materias que se desbloquean (directamente) gracias a esta. */
+const HABILITA: Record<number, number[]> = Object.fromEntries(
+  PLAN.map((mat) => [
+    mat.id,
+    PLAN.filter((o) => o.id !== 39 && (o.cursada.includes(mat.id) || o.rendida.includes(mat.id))).map((o) => o.id),
+  ])
+);
+
+/* =========================================================================
+ * ESTILOS
+ * ========================================================================= */
+
+const VISTA_META: Record<Vista, { label: string; pill: string }> = {
+  aprobada: { label: "Aprobada", pill: "bg-emerald-600 text-white" },
+  retenida: { label: "Aprobada · retenida", pill: "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300" },
+  regular: { label: "Regular", pill: "bg-sky-600 text-white" },
+  cursando: { label: "Cursando", pill: "bg-amber-400 text-amber-950" },
+  libre: { label: "Libre", pill: "bg-rose-600 text-white" },
+  recursar: { label: "Recursar", pill: "bg-orange-500 text-white" },
+  disponible: { label: "Disponible", pill: "bg-white text-neutral-800 ring-1 ring-neutral-400" },
+  bloqueada: { label: "Bloqueada", pill: "bg-neutral-200 text-neutral-500" },
 };
 
-const INITIAL_TASKS: Task[] = [
-  { id: uid(), text: "Terminar el modulo de autenticacion del proyecto Next.js", priority: "A", done: false },
-  { id: uid(), text: "Resolver tickets criticos de soporte tecnico FA", priority: "A", done: false },
-  { id: uid(), text: "Repasar apuntes para el parcial de la UNSJ", priority: "B", done: false },
-  { id: uid(), text: "Responder mensajes no urgentes del equipo", priority: "C", done: false },
-  { id: uid(), text: "Armar el informe mensual (delegar a un companero)", priority: "D", done: false },
-  { id: uid(), text: "Revisar redes sociales", priority: "E", done: false },
-];
+const ANIOS = [1, 2, 3, 4, 5];
+const ORDINAL = ["", "1er", "2do", "3er", "4to", "5to"];
 
-const DEFAULT_GOALS: [string, string, string] = [
-  "Terminar el ciclo lectivo en la UNSJ con excelente rendimiento academico.",
-  "Crecer como desarrollador Next.js y asumir mas responsabilidad en el trabajo.",
-  "Sostener el entrenamiento de hipertrofia con constancia, sin cortar la racha.",
-];
-
-const TRACY_QUOTES: string[] = [
-  "La Hora de Oro: Dedica los primeros 60 minutos de la manana a estudiar ciencias de la computacion o leer sobre sistemas, antes de revisar el celular.",
-  "Orientacion a la accion: Si tienes reparaciones tecnicas pendientes o codigo que escribir, atacalo de inmediato. El sentido de urgencia multiplica la productividad.",
-  "Energia y Vitalidad: Tu agudeza mental en el trabajo y la universidad depende de tu fisico. Asegurate de cumplir con tu entrenamiento de hipertrofia hoy.",
-  "Planificacion Continua: Escribe tus metas en presente todos los dias. Que habilidades nuevas de programacion vas a dominar este mes?",
-];
-
-const HABITS: string[] = [
-  "Soporte tecnico FA",
-  "Estudio UNSJ",
-  "Gym (Hipertrofia)",
-  "Proyecto Next.js",
-  "Futbol",
-];
-
-const DAYS_IN_MONTH = 31;
+type Filtro = "todas" | "tup" | "accion";
 
 /* =========================================================================
- * GEOMETRIA DEL TRACKER CIRCULAR (SVG puro + trigonometria)
+ * PAGINA
  * ========================================================================= */
 
-const CX = 210;
-const CY = 300;
-// Radios mas grandes que el minimo "elegante" a proposito: en pantallas
-// tactiles (celular) las celdas del anillo interior son las mas chicas del
-// grafico, asi que agrandamos todo el semicirculo para que sigan siendo
-// tocables. El SVG no se achica en mobile (ver mas abajo) y el contenedor
-// permite scroll horizontal si no entra en pantalla.
-const BASE_INNER_RADIUS = 65;
-const RING_WIDTH = 34;
-const RING_GAP = 7;
-const START_ANGLE = -90; // arriba
-const END_ANGLE = 90; // abajo (semicirculo que abre hacia la derecha)
-const ANGLE_STEP = (END_ANGLE - START_ANGLE) / DAYS_IN_MONTH;
-const CELL_PADDING_DEG = 0.5;
-const SVG_VIEWBOX_MIN_X = -140;
-const SVG_VIEWBOX_WIDTH = 660;
-const SVG_VIEWBOX_HEIGHT = 600;
+export default function CarreraPage() {
+  const [data, setRaw, hydrated] = useLocalStorage<CarreraData>("carrera.v1", EMPTY);
+  const setData = (fn: (d: CarreraData) => CarreraData) => setRaw((d) => ({ ...fn(d), updatedAt: Date.now() }));
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [filtro, setFiltro] = useLocalStorage<Filtro>("carrera.filtro", "todas");
+  const [abierta, setAbierta] = useState<number | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
-// Redondeamos a 2 decimales: de sobra para la precision visual del SVG, y
-// evita mismatches de hidratacion por diferencias de punto flotante entre
-// el motor JS del servidor (build estatico) y el del navegador.
-const round2 = (n: number) => Math.round(n * 100) / 100;
+  const info = useMemo(() => calcular(data), [data]);
+  const st = (id: number) => data.materias[id] ?? DEFAULT_STATE;
 
-function polarToCartesian(cx: number, cy: number, r: number, angleDeg: number) {
-  const angleRad = (angleDeg * Math.PI) / 180;
-  return {
-    x: round2(cx + r * Math.cos(angleRad)),
-    y: round2(cy + r * Math.sin(angleRad)),
-  };
-}
+  const update = (id: number, patch: Partial<MateriaState>) =>
+    setData((d) => ({
+      ...d,
+      materias: { ...d.materias, [id]: { ...(d.materias[id] ?? DEFAULT_STATE), ...patch } },
+    }));
 
-function arcSectorPath(
-  cx: number,
-  cy: number,
-  innerR: number,
-  outerR: number,
-  startAngle: number,
-  endAngle: number
-) {
-  const p1 = polarToCartesian(cx, cy, outerR, startAngle);
-  const p2 = polarToCartesian(cx, cy, outerR, endAngle);
-  const p3 = polarToCartesian(cx, cy, innerR, endAngle);
-  const p4 = polarToCartesian(cx, cy, innerR, startAngle);
-  const largeArc = endAngle - startAngle > 180 ? 1 : 0;
-  return [
-    `M ${p1.x} ${p1.y}`,
-    `A ${outerR} ${outerR} 0 ${largeArc} 1 ${p2.x} ${p2.y}`,
-    `L ${p3.x} ${p3.y}`,
-    `A ${innerR} ${innerR} 0 ${largeArc} 0 ${p4.x} ${p4.y}`,
-    "Z",
-  ].join(" ");
-}
+  // ---- Estadisticas ----
+  const stats = useMemo(() => {
+    const aprobadas = PLAN.filter((mat) => info[mat.id].aprobada);
+    const tupAprob = TUP_IDS.filter((id) => info[id].aprobada).length;
+    const tupTotal = TUP_IDS.length + 1; // + Practica Socio-Educativa
+    const tupPct = ((tupAprob + (data.practica ? 1 : 0)) / tupTotal) * 100;
+    const licPct = (aprobadas.length / PLAN.length) * 100;
 
-// habito index 0 = anillo mas exterior (arriba), ultimo habito = anillo mas interior (cerca del centro)
-function radiusRangeFor(habitIndex: number) {
-  const fromInside = HABITS.length - 1 - habitIndex;
-  const innerR = BASE_INNER_RADIUS + fromInside * (RING_WIDTH + RING_GAP);
-  const outerR = innerR + RING_WIDTH;
-  return { innerR, outerR };
-}
+    const notas = aprobadas.map((mat) => st(mat.id).notaFinal).filter((n): n is number => typeof n === "number");
+    const aplazos = PLAN.flatMap((mat) => st(mat.id).intentos.filter((i) => i.nota < NOTA_APROBACION).map((i) => i.nota));
+    const prom = (xs: number[]) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null);
 
-const OUTERMOST_RADIUS = radiusRangeFor(0).outerR;
-const DAY_TICKS = [1, 5, 10, 15, 20, 25, 31];
+    const tupNotas = TUP_IDS.filter((id) => info[id].aprobada)
+      .map((id) => st(id).notaFinal)
+      .filter((n): n is number => typeof n === "number");
 
-/* =========================================================================
- * COMPONENTE PRINCIPAL
- * ========================================================================= */
-
-export default function Home() {
-  const [today, setToday] = useState<Date | null>(null);
-  useEffect(() => setToday(new Date()), []);
-  const currentDay = today ? today.getDate() : null;
-
-  // --- ABCDE / Eat That Frog ---
-  const [tasks, setTasks] = useLocalStorage<Task[]>("tracker.tasks", INITIAL_TASKS);
-  const [newTaskText, setNewTaskText] = useState("");
-  const [newTaskPriority, setNewTaskPriority] = useState<Priority>("A");
-
-  const rankedTasks = useMemo(() => {
-    const sorted = [...tasks].sort(
-      (a, b) => PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority]
-    );
-    const counts: Partial<Record<Priority, number>> = {};
-    return sorted.map((task) => {
-      counts[task.priority] = (counts[task.priority] ?? 0) + 1;
-      return { ...task, rank: counts[task.priority] as number };
-    });
-  }, [tasks]);
-
-  const frog = rankedTasks.find((t) => t.priority === "A" && t.rank === 1);
-
-  function addTask(text: string, priority: Priority) {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    setTasks((prev) => [...prev, { id: uid(), text: trimmed, priority, done: false }]);
-  }
-
-  function toggleDone(id: string) {
-    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
-  }
-
-  function removeTask(id: string) {
-    setTasks((prev) => prev.filter((t) => t.id !== id));
-  }
-
-  // --- La Ley del Tres ---
-  const [threeGoals, setThreeGoals] = useLocalStorage<string[]>("tracker.goals", DEFAULT_GOALS);
-
-  function addGoal() {
-    setThreeGoals((prev) => [...prev, ""]);
-  }
-
-  function removeGoal(index: number) {
-    setThreeGoals((prev) => prev.filter((_, idx) => idx !== index));
-  }
-
-  // --- Tracy Bot ---
-  const [quoteIndex, setQuoteIndex] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => {
-      setQuoteIndex((i) => (i + 1) % TRACY_QUOTES.length);
-    }, 9000);
-    return () => clearInterval(id);
-  }, []);
-
-  // --- Regla del 10/90: cierre de dia ---
-  const [isDayCloseOpen, setIsDayCloseOpen] = useState(false);
-  const [tomorrowDraft, setTomorrowDraft] = useState<Task[]>([]);
-  const [draftText, setDraftText] = useState("");
-  const [draftPriority, setDraftPriority] = useState<Priority>("A");
-  const [closeMessage, setCloseMessage] = useState("");
-
-  const canConfirmClose = tomorrowDraft.length >= 3 && tomorrowDraft.some((t) => t.priority === "A");
-
-  // Evita el scroll de fondo en el celular mientras el modal esta abierto
-  useEffect(() => {
-    if (!isDayCloseOpen) return;
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    return () => {
-      document.body.style.overflow = previousOverflow;
+    const count = (v: Vista) => PLAN.filter((mat) => info[mat.id].vista === v).length;
+    return {
+      aprobadas: aprobadas.length,
+      tupAprob,
+      tupTotal,
+      tupPct,
+      licPct,
+      promedio: prom(notas),
+      promedioAplazos: prom([...notas, ...aplazos]),
+      promedioTup: prom(tupNotas),
+      regulares: count("regular"),
+      cursando: count("cursando"),
+      disponibles: count("disponible"),
     };
-  }, [isDayCloseOpen]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info, data]);
 
-  function addDraftTask() {
-    const trimmed = draftText.trim();
-    if (!trimmed) return;
-    setTomorrowDraft((prev) => [...prev, { id: uid(), text: trimmed, priority: draftPriority, done: false }]);
-    setDraftText("");
-  }
-
-  function removeDraftTask(id: string) {
-    setTomorrowDraft((prev) => prev.filter((t) => t.id !== id));
-  }
-
-  function confirmDayClose() {
-    if (!canConfirmClose) return;
-    setTasks(tomorrowDraft.map((t) => ({ ...t, done: false })));
-    setTomorrowDraft([]);
-    setIsDayCloseOpen(false);
-    setCloseMessage(
-      '"1 minuto de planificacion ahorra 10 de ejecucion." Manana ya esta planificado.'
+  // Proximos pasos: primero TUP, despues el resto
+  const proximas = useMemo(() => {
+    const puedeRendirYa = PLAN.filter(
+      (mat) => (info[mat.id].vista === "regular" || info[mat.id].vista === "libre") && info[mat.id].puedeRendir
     );
-    setTimeout(() => setCloseMessage(""), 6000);
-  }
+    const paraCursar = PLAN.filter((mat) => info[mat.id].vista === "disponible");
+    const orden = (a: Materia, b: Materia) => Number(b.tup) - Number(a.tup) || a.id - b.id;
+    return { finales: puedeRendirYa.sort(orden), cursar: paraCursar.sort(orden) };
+  }, [info]);
 
-  // --- Tracker de habitos (una grilla por mes: "AAAA-M") ---
-  const monthKey = today ? `${today.getFullYear()}-${today.getMonth() + 1}` : null;
-  const [allMarks, setAllMarks] = useLocalStorage<Record<string, Record<string, boolean>>>(
-    "tracker.marks",
-    {}
-  );
-  const marks = monthKey ? allMarks[monthKey] ?? {} : {};
-  function toggleMark(habitIndex: number, day: number) {
-    if (!monthKey) return;
-    const cellKey = `${habitIndex}-${day}`;
-    setAllMarks((prev) => {
-      const monthMarks = { ...(prev[monthKey] ?? {}) };
-      monthMarks[cellKey] = !monthMarks[cellKey];
-      return { ...prev, [monthKey]: monthMarks };
-    });
-  }
-  function habitCompletion(habitIndex: number) {
-    let count = 0;
-    for (let d = 1; d <= DAYS_IN_MONTH; d++) if (marks[`${habitIndex}-${d}`]) count++;
-    return Math.round((count / DAYS_IN_MONTH) * 100);
-  }
+  // ---- Google Sheets ----
+  const sync = useSheetSync(data, setRaw, hydrated, () => ({
+    filas: [
+      ["Código", "Materia", "Año", "TUP", "Estado", "Vía", "Nota cursada", "Fecha regular", "Nota final", "Fecha aprobada", "Finales rendidos"],
+      ...PLAN.map((mat) => {
+        const s = st(mat.id);
+        const v = info[mat.id].vista;
+        return [
+          mat.id,
+          nombre(data, mat.id),
+          mat.anio,
+          mat.tup ? "Sí" : "",
+          etiqueta(s, info[mat.id]),
+          s.estado === "aprobada" ? s.via ?? "" : "",
+          s.notaCursada ?? "",
+          s.fechaRegular ?? "",
+          s.estado === "aprobada" ? s.notaFinal ?? "" : "",
+          s.estado === "aprobada" ? s.fechaAprobada ?? "" : "",
+          s.intentos.map((x) => `${x.fecha}: ${x.nota}${x.tipo === "libre" ? " (libre)" : ""}`).join("; "),
+        ];
+      }),
+    ],
+    resumen: [
+      ["Indicador", "Valor"],
+      ["TUP %", Math.round(stats.tupPct)],
+      ["TUP materias aprobadas", `${stats.tupAprob}/${TUP_IDS.length}`],
+      ["Práctica Socio-Educativa", data.practica ? "Cumplida" : "Pendiente"],
+      ["Licenciatura %", Math.round(stats.licPct)],
+      ["Licenciatura materias aprobadas", `${stats.aprobadas}/${PLAN.length}`],
+      ["Promedio (sin aplazos)", stats.promedio !== null ? Number(stats.promedio.toFixed(2)) : ""],
+      ["Promedio (con aplazos)", stats.promedioAplazos !== null ? Number(stats.promedioAplazos.toFixed(2)) : ""],
+      ["Regulares", stats.regulares],
+      ["Cursando", stats.cursando],
+      ["Actualizado", new Date(data.updatedAt ?? Date.now()).toLocaleString("es-AR")],
+    ],
+  }));
 
-  // --- Notas ---
-  const [notes, setNotes] = useLocalStorage<string>("tracker.notes", "");
+  const visible = (mat: Materia) => {
+    if (filtro === "tup") return mat.tup;
+    if (filtro === "accion") return !["aprobada", "bloqueada"].includes(info[mat.id].vista);
+    return true;
+  };
 
-  const monthLabel = today
-    ? today.toLocaleDateString("es-AR", { month: "long", year: "numeric" })
-    : "";
+  // ---- Backup ----
+  const exportar = () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `carrera-backup-${hoy()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const importar = async (file: File) => {
+    try {
+      const parsed = JSON.parse(await file.text()) as CarreraData;
+      if (!parsed || typeof parsed.materias !== "object") throw new Error();
+      setData(() => ({ materias: parsed.materias, practica: !!parsed.practica }));
+    } catch {
+      alert("El archivo no es un backup válido.");
+    }
+  };
 
   return (
-    <main className="min-h-screen bg-neutral-50 px-4 py-10 sm:px-8">
-      <div className="mx-auto max-w-6xl space-y-8">
+    <main className="min-h-screen bg-neutral-50 px-4 py-8 sm:px-8">
+      <div className="mx-auto max-w-6xl space-y-6">
         {/* ---------------- HEADER ---------------- */}
         <header className="flex flex-col gap-4 border-b border-neutral-200 pb-6 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <p className="text-xs uppercase tracking-[0.25em] text-neutral-400">Agenda personal</p>
-            <h1 className="font-serif text-3xl font-semibold text-neutral-900">
-              Personal Tracker Dashboard
-            </h1>
-          </div>
-          <div className="flex flex-col items-start gap-2 sm:items-end">
-            <p className="text-sm capitalize text-neutral-500">
-              {today
-                ? today.toLocaleDateString("es-AR", {
-                    weekday: "long",
-                    day: "numeric",
-                    month: "long",
-                    year: "numeric",
-                  })
-                : ""}
+            <p className="text-xs uppercase tracking-[0.25em] text-neutral-400">Seguimiento académico</p>
+            <h1 className="mt-1 font-serif text-3xl font-semibold text-neutral-900">Mi Carrera</h1>
+            <p className="text-sm text-neutral-500">
+              Lic. en Ciencias de la Computación · UNSJ · Plan Ord. 10/2022
             </p>
-            <div className="flex flex-wrap gap-2">
-            <Link
-              href="/carrera"
-              className="inline-flex items-center gap-2 rounded-full border border-neutral-300 bg-white px-5 py-2.5 text-sm font-medium text-neutral-800 transition-colors hover:bg-neutral-100"
-            >
-              Mi Carrera
-            </Link>
-            <button
-              onClick={() => setIsDayCloseOpen(true)}
-              className="inline-flex items-center gap-2 rounded-full bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-neutral-700 active:bg-neutral-800"
-            >
-              <span className="sm:hidden">Cierre de Dia</span>
-              <span className="hidden sm:inline">Cierre de Dia · Regla 10/90</span>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <SyncPill status={sync.status} lastSync={sync.lastSync} onClick={() => setSyncOpen(true)} />
+            <button onClick={exportar} className="rounded-full border border-neutral-300 bg-white px-4 py-2 text-sm hover:bg-neutral-100">
+              Exportar backup
             </button>
-            </div>
+            <button
+              onClick={() => fileRef.current?.click()}
+              className="rounded-full border border-neutral-300 bg-white px-4 py-2 text-sm hover:bg-neutral-100"
+            >
+              Importar
+            </button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) importar(f);
+                e.target.value = "";
+              }}
+            />
           </div>
         </header>
 
-        {closeMessage && (
-          <div className="rounded-lg border border-neutral-300 bg-white px-4 py-3 text-sm text-neutral-600">
-            {closeMessage}
-          </div>
-        )}
-
-        {/* ---------------- LEY DEL TRES ---------------- */}
-        <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <h2 className="font-serif text-lg font-semibold text-neutral-900">La Ley del Tres</h2>
-              <p className="text-xs text-neutral-500">
-                Los macro-objetivos que aportan el 90% de tu valor a largo plazo. Lo ideal son 3:
-                mas que eso y dejan de ser "macro".
-              </p>
-            </div>
-            <button
-              onClick={addGoal}
-              className="flex-shrink-0 rounded-full border border-neutral-200 px-3 py-1.5 text-xs font-medium text-neutral-600 transition-colors hover:bg-neutral-50 active:bg-neutral-100"
-            >
-              + Agregar objetivo
-            </button>
-          </div>
-          <div className="grid gap-3 sm:grid-cols-3">
-            {threeGoals.map((goal, i) => (
-              <div key={i} className="relative rounded-xl border border-neutral-200 bg-neutral-50 p-3">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-medium uppercase tracking-wide text-neutral-400">
-                    Objetivo {i + 1}
-                  </label>
-                  <button
-                    onClick={() => removeGoal(i)}
-                    aria-label="Quitar objetivo"
-                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center text-base text-neutral-300 transition-colors hover:text-neutral-600"
-                  >
-                    &times;
-                  </button>
-                </div>
-                <textarea
-                  value={goal}
-                  rows={3}
-                  onChange={(e) => {
-                    const value = e.target.value;
-                    setThreeGoals((prev) => prev.map((g, idx) => (idx === i ? value : g)));
-                  }}
-                  className="w-full resize-none rounded-md border-none bg-transparent text-sm text-neutral-800 focus:outline-none focus:ring-1 focus:ring-neutral-300"
-                />
+        {/* ---------------- PROGRESO ---------------- */}
+        <section className="grid gap-4 md:grid-cols-3">
+          <div className="rounded-2xl border-2 border-indigo-300 bg-indigo-50 p-5 md:col-span-2">
+            <div className="flex items-baseline justify-between gap-2">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-widest text-indigo-700">Prioridad · Título intermedio</p>
+                <h2 className="font-serif text-xl font-semibold text-indigo-950">Tecnicatura Universitaria en Programación</h2>
               </div>
-            ))}
-            {threeGoals.length === 0 && (
-              <p className="py-4 text-sm text-neutral-400 sm:col-span-3">
-                No hay objetivos. Agrega el primero.
-              </p>
-            )}
+              <p className="text-4xl font-semibold tabular-nums text-indigo-700">{Math.round(stats.tupPct)}%</p>
+            </div>
+            <Bar pct={stats.tupPct} color="bg-indigo-600" track="bg-indigo-100" />
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-sm text-indigo-900">
+              <span>
+                {stats.tupAprob} / {TUP_IDS.length} materias aprobadas
+                {stats.promedioTup !== null && <> · promedio TUP {stats.promedioTup.toFixed(2)}</>}
+              </span>
+              <label className="inline-flex cursor-pointer items-center gap-2 rounded-full bg-white px-3 py-1.5 ring-1 ring-indigo-200">
+                <input
+                  type="checkbox"
+                  checked={data.practica}
+                  onChange={(e) => setData((d) => ({ ...d, practica: e.target.checked }))}
+                  className="h-4 w-4 accent-indigo-600"
+                />
+                Práctica Socio-Educativa cumplida
+              </label>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-neutral-200 bg-white p-5">
+            <div className="flex items-baseline justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-widest text-neutral-500">Título de grado</p>
+                <h2 className="font-serif text-xl font-semibold">Licenciatura</h2>
+              </div>
+              <p className="text-4xl font-semibold tabular-nums text-neutral-800">{Math.round(stats.licPct)}%</p>
+            </div>
+            <Bar pct={stats.licPct} color="bg-neutral-800" track="bg-neutral-100" />
+            <p className="mt-3 text-sm text-neutral-600">
+              {stats.aprobadas} / {PLAN.length} materias aprobadas
+            </p>
           </div>
         </section>
 
-        {/* ---------------- ABCDE + TRACY BOT ---------------- */}
-        <div className="grid gap-6 lg:grid-cols-3">
-          {/* Gestor ABCDE */}
-          <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm lg:col-span-2">
-            <div className="mb-4 flex items-center justify-between">
-              <div>
-                <h2 className="font-serif text-lg font-semibold text-neutral-900">
-                  Gestor ABCDE · Eat That Frog
-                </h2>
-                <p className="text-xs text-neutral-500">
-                  A: Vital · B: Importante · C: Agradable · D: Delegar · E: Eliminar
-                </p>
-              </div>
-            </div>
+        <section className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+          <Stat label="Promedio" value={stats.promedio?.toFixed(2) ?? "—"} hint="sin aplazos" />
+          <Stat label="Con aplazos" value={stats.promedioAplazos?.toFixed(2) ?? "—"} hint="incluye finales desaprobados" />
+          <Stat label="Regulares" value={stats.regulares} hint="finales pendientes" />
+          <Stat label="Cursando" value={stats.cursando} />
+          <Stat label="Disponibles" value={stats.disponibles} hint="para inscribirte" />
+        </section>
 
-            {frog && (
-              <div className="mb-5 rounded-xl border-2 border-neutral-900 bg-neutral-900 p-4 text-white">
-                <p className="text-[11px] uppercase tracking-widest text-neutral-300">
-                  Sapo del Dia · A1
-                </p>
-                <p className="mt-1 text-lg font-medium">{frog.text}</p>
-                <button
-                  onClick={() => toggleDone(frog.id)}
-                  className="mt-3 rounded-full border border-white/30 px-3 py-1 text-xs transition-colors hover:bg-white/10"
-                >
-                  {frog.done ? "Marcado como hecho" : "Marcar como comido"}
-                </button>
-              </div>
-            )}
-
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                addTask(newTaskText, newTaskPriority);
-                setNewTaskText("");
-              }}
-              className="mb-4 flex flex-col gap-2 sm:flex-row"
-            >
-              <input
-                value={newTaskText}
-                onChange={(e) => setNewTaskText(e.target.value)}
-                placeholder="Nueva tarea..."
-                className="flex-1 rounded-lg border border-neutral-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-400"
-              />
-              <select
-                value={newTaskPriority}
-                onChange={(e) => setNewTaskPriority(e.target.value as Priority)}
-                className="rounded-lg border border-neutral-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-400"
-              >
-                {(Object.keys(PRIORITY_META) as Priority[]).map((p) => (
-                  <option key={p} value={p}>
-                    {p} · {PRIORITY_META[p].label}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="submit"
-                className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
-              >
-                Agregar
-              </button>
-            </form>
-
-            <div className="space-y-2">
-              {rankedTasks
-                .filter((t) => t.id !== frog?.id)
-                .map((task) => (
-                  <div
-                    key={task.id}
-                    className={`flex items-center justify-between gap-3 rounded-lg border border-neutral-100 px-3 py-2 ${
-                      task.done ? "opacity-40" : ""
-                    }`}
-                  >
-                    <div className="flex min-w-0 items-center gap-1">
-                      <button
-                        onClick={() => toggleDone(task.id)}
-                        aria-label="Marcar como hecha"
-                        className="flex h-9 w-9 flex-shrink-0 items-center justify-center"
-                      >
-                        <span
-                          className={`h-5 w-5 rounded-full border ${
-                            task.done ? "border-neutral-900 bg-neutral-900" : "border-neutral-300"
-                          }`}
-                        />
-                      </button>
-                      <span className={`truncate text-sm ${task.done ? "line-through" : ""}`}>
-                        {task.text}
-                      </span>
-                    </div>
-                    <div className="flex flex-shrink-0 items-center gap-1">
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
-                          PRIORITY_META[task.priority].badge
-                        }`}
-                      >
-                        {task.priority}
-                        {task.rank}
-                      </span>
-                      <button
-                        onClick={() => removeTask(task.id)}
-                        aria-label="Eliminar tarea"
-                        className="flex h-9 w-9 flex-shrink-0 items-center justify-center text-lg text-neutral-300 transition-colors hover:text-neutral-600"
-                      >
-                        &times;
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              {tasks.length === 0 && (
-                <p className="py-6 text-center text-sm text-neutral-400">
-                  No hay tareas. Agrega la primera.
-                </p>
+        {/* ---------------- PROXIMOS PASOS ---------------- */}
+        {hydrated && (proximas.finales.length > 0 || proximas.cursar.length > 0) && (
+          <section className="rounded-2xl border border-neutral-200 bg-white p-5">
+            <h2 className="font-serif text-lg font-semibold">Próximos pasos</h2>
+            <div className="mt-3 grid gap-4 md:grid-cols-2">
+              {proximas.finales.length > 0 && (
+                <div>
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-sky-700">Podés rendir el final</p>
+                  <Chips items={proximas.finales} onOpen={setAbierta} data={data} />
+                </div>
+              )}
+              {proximas.cursar.length > 0 && (
+                <div>
+                  <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-neutral-500">Podés cursar</p>
+                  <Chips items={proximas.cursar} onOpen={setAbierta} data={data} />
+                </div>
               )}
             </div>
           </section>
+        )}
 
-          {/* Tracy Bot */}
-          <div className="flex flex-col gap-6">
-            <section className="rounded-2xl border border-neutral-200 bg-neutral-900 p-6 text-white shadow-sm">
-              <div className="flex items-center gap-2 text-xs uppercase tracking-widest text-neutral-300">
-                Tracy Bot · Consejo del dia
-              </div>
-              <p className="mt-3 min-h-[120px] text-sm leading-relaxed">
-                {TRACY_QUOTES[quoteIndex]}
-              </p>
-              <div className="mt-4 flex items-center justify-between">
-                <div className="flex gap-1">
-                  {TRACY_QUOTES.map((_, i) => (
-                    <span
-                      key={i}
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        i === quoteIndex ? "bg-white" : "bg-white/20"
-                      }`}
-                    />
-                  ))}
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() =>
-                      setQuoteIndex((i) => (i - 1 + TRACY_QUOTES.length) % TRACY_QUOTES.length)
-                    }
-                    className="rounded-full border border-white/20 px-2 py-1 text-xs transition-colors hover:bg-white/10"
-                    aria-label="Consejo anterior"
-                  >
-                    &lsaquo;
-                  </button>
-                  <button
-                    onClick={() => setQuoteIndex((i) => (i + 1) % TRACY_QUOTES.length)}
-                    className="rounded-full border border-white/20 px-2 py-1 text-xs transition-colors hover:bg-white/10"
-                    aria-label="Siguiente consejo"
-                  >
-                    &rsaquo;
-                  </button>
-                </div>
-              </div>
-            </section>
-
-            <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
-              <h2 className="mb-3 font-serif text-base font-semibold text-neutral-900">
-                Resumen del dia
-              </h2>
-              <dl className="space-y-2 text-sm">
-                <div className="flex items-center justify-between">
-                  <dt className="text-neutral-500">Tareas A pendientes</dt>
-                  <dd className="font-medium">
-                    {tasks.filter((t) => t.priority === "A" && !t.done).length}
-                  </dd>
-                </div>
-                <div className="flex items-center justify-between">
-                  <dt className="text-neutral-500">Tareas completadas</dt>
-                  <dd className="font-medium">{tasks.filter((t) => t.done).length}</dd>
-                </div>
-                <div className="flex items-center justify-between">
-                  <dt className="text-neutral-500">Total de tareas</dt>
-                  <dd className="font-medium">{tasks.length}</dd>
-                </div>
-              </dl>
-            </section>
+        {/* ---------------- FILTROS + LEYENDA ---------------- */}
+        <section className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="inline-flex rounded-full bg-neutral-200 p-1 text-sm">
+            {(
+              [
+                ["todas", "Todas"],
+                ["tup", "Solo TUP"],
+                ["accion", "En curso / disponibles"],
+              ] as [Filtro, string][]
+            ).map(([k, label]) => (
+              <button
+                key={k}
+                onClick={() => setFiltro(k)}
+                className={`rounded-full px-3 py-1.5 transition-colors ${
+                  filtro === k ? "bg-white font-medium shadow-sm" : "text-neutral-600 hover:text-neutral-900"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-        </div>
-
-        {/* ---------------- TRACKER DE HABITOS (SVG) ---------------- */}
-        <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
-          <div className="mb-4">
-            <h2 className="font-serif text-lg font-semibold text-neutral-900 capitalize">
-              Tracker de Habitos {monthLabel && `· ${monthLabel}`}
-            </h2>
-            <p className="text-xs text-neutral-500">
-              Toca un arco para marcar el dia. Volve a tocarlo para desmarcarlo.
-              <span className="block sm:hidden">Desliza horizontalmente para ver todos los dias.</span>
-            </p>
-          </div>
-
-          <div className="overflow-x-auto">
-            <svg
-              viewBox={`${SVG_VIEWBOX_MIN_X} 0 ${SVG_VIEWBOX_WIDTH} ${SVG_VIEWBOX_HEIGHT}`}
-              width={SVG_VIEWBOX_WIDTH}
-              height={SVG_VIEWBOX_HEIGHT}
-              className="mx-auto block max-w-none"
-            >
-              {/* linea de guia horizontal (estilo hoja de agenda) */}
-              <line x1={20} y1={CY} x2={40} y2={CY} stroke="transparent" />
-
-              {HABITS.map((habit, h) => {
-                const { innerR, outerR } = radiusRangeFor(h);
-                const avgR = (innerR + outerR) / 2;
-                const labelPoint = polarToCartesian(CX, CY, avgR, START_ANGLE);
-                const pct = habitCompletion(h);
-
-                return (
-                  <g key={habit}>
-                    <line
-                      x1={40}
-                      y1={labelPoint.y}
-                      x2={labelPoint.x - 6}
-                      y2={labelPoint.y}
-                      stroke="#d4d4d4"
-                      strokeDasharray="2 3"
-                    />
-                    <text
-                      x={36}
-                      y={labelPoint.y - 2}
-                      textAnchor="end"
-                      className="fill-neutral-700 text-[13px] font-medium"
-                    >
-                      {habit}
-                    </text>
-                    <text
-                      x={36}
-                      y={labelPoint.y + 13}
-                      textAnchor="end"
-                      className="fill-neutral-400 text-[10px]"
-                    >
-                      {pct}% del mes
-                    </text>
-
-                    {Array.from({ length: DAYS_IN_MONTH }).map((_, dIdx) => {
-                      const day = dIdx + 1;
-                      const startAngle = START_ANGLE + dIdx * ANGLE_STEP + CELL_PADDING_DEG;
-                      const endAngle = START_ANGLE + (dIdx + 1) * ANGLE_STEP - CELL_PADDING_DEG;
-                      const path = arcSectorPath(CX, CY, innerR, outerR, startAngle, endAngle);
-                      const filled = !!marks[`${h}-${day}`];
-                      const isToday = currentDay === day;
-
-                      return (
-                        <path
-                          key={day}
-                          d={path}
-                          onClick={() => toggleMark(h, day)}
-                          stroke={isToday ? "#171717" : "#ffffff"}
-                          strokeWidth={isToday ? 1.5 : 1}
-                          className={`cursor-pointer transition-colors duration-150 ${
-                            filled ? "" : "hover:fill-neutral-400"
-                          }`}
-                          style={{ touchAction: "manipulation", fill: filled ? "#171717" : "#ececeb" }}
-                        >
-                          <title>{`${habit} - dia ${day}`}</title>
-                        </path>
-                      );
-                    })}
-                  </g>
-                );
-              })}
-
-              {/* marcas de dias sobre el anillo exterior */}
-              {DAY_TICKS.map((day) => {
-                const angle = START_ANGLE + (day - 0.5) * ANGLE_STEP;
-                const p = polarToCartesian(CX, CY, OUTERMOST_RADIUS + 16, angle);
-                return (
-                  <text
-                    key={day}
-                    x={p.x}
-                    y={p.y}
-                    textAnchor="middle"
-                    dominantBaseline="middle"
-                    className="fill-neutral-400 text-[9px]"
-                  >
-                    {day}
-                  </text>
-                );
-              })}
-            </svg>
+          <div className="flex flex-wrap gap-1.5 text-xs">
+            <span className="rounded-full bg-indigo-600 px-2 py-0.5 font-semibold text-white">TUP</span>
+            {(["aprobada", "regular", "cursando", "libre", "recursar", "disponible", "bloqueada"] as Vista[]).map((v) => (
+              <span key={v} className={`rounded-full px-2 py-0.5 ${VISTA_META[v].pill}`}>
+                {VISTA_META[v].label}
+              </span>
+            ))}
           </div>
         </section>
 
-        {/* ---------------- NOTAS ---------------- */}
-        <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm">
-          <h2 className="mb-3 font-serif text-lg font-semibold text-neutral-900">Notas</h2>
-          <textarea
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            placeholder="Ideas, pendientes, aprendizajes del dia..."
-            className="h-40 w-full rounded-lg border border-neutral-200 p-4 font-mono text-sm text-neutral-700 focus:outline-none focus:ring-1 focus:ring-neutral-400"
-            style={{
-              backgroundImage:
-                "linear-gradient(to right, rgba(0,0,0,0.05) 1px, transparent 1px), linear-gradient(to bottom, rgba(0,0,0,0.05) 1px, transparent 1px)",
-              backgroundSize: "22px 22px",
-            }}
-          />
-        </section>
+        {/* ---------------- MATERIAS POR AÑO ---------------- */}
+        {ANIOS.map((anio) => {
+          const mats = PLAN.filter((mat) => mat.anio === anio && visible(mat));
+          if (!mats.length) return null;
+          const aprob = PLAN.filter((mat) => mat.anio === anio && info[mat.id].aprobada).length;
+          const total = PLAN.filter((mat) => mat.anio === anio).length;
+          return (
+            <section key={anio}>
+              <div className="mb-2 flex items-baseline justify-between">
+                <h2 className="font-serif text-lg font-semibold">{ORDINAL[anio]} Año</h2>
+                <span className="text-xs text-neutral-500">
+                  {aprob}/{total} aprobadas
+                </span>
+              </div>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                {mats.map((mat) => (
+                  <MateriaCard key={mat.id} mat={mat} s={st(mat.id)} i={info[mat.id]} data={data} onOpen={() => setAbierta(mat.id)} />
+                ))}
+              </div>
+            </section>
+          );
+        })}
+
+        <p className="pb-6 text-center text-xs text-neutral-400">
+          Correlatividades según Res. 109/2022-CD-FCEFN. Los datos se guardan en este navegador; usá “Exportar backup” para
+          pasarlos a otro dispositivo.
+        </p>
       </div>
 
-      {/* ---------------- MODAL: REGLA DEL 10/90 ---------------- */}
-      {isDayCloseOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-          <div className="max-h-[85vh] w-full max-w-lg overflow-y-auto rounded-2xl bg-white p-6 shadow-xl">
-            <p className="text-[11px] uppercase tracking-widest text-neutral-400">
-              Regla del 10/90
-            </p>
-            <h2 className="mt-1 font-serif text-xl font-semibold text-neutral-900">
-              Cierre de Dia
-            </h2>
-            <p className="mt-2 text-sm text-neutral-500">
-              1 minuto de planificacion ahorra 10 de ejecucion. Deja planificadas y
-              categorizadas las tareas de manana antes de cerrar (minimo 3, incluyendo al
-              menos una A).
-            </p>
+      {syncOpen && (
+        <SyncModal
+          cfg={sync.cfg}
+          status={sync.status}
+          error={sync.error}
+          onSave={(c) => sync.setCfg(c)}
+          onSyncNow={sync.sincronizar}
+          onClose={() => setSyncOpen(false)}
+        />
+      )}
 
-            <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-              <input
-                value={draftText}
-                onChange={(e) => setDraftText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    addDraftTask();
-                  }
-                }}
-                placeholder="Tarea para manana..."
-                className="flex-1 rounded-lg border border-neutral-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-400"
-              />
-              <select
-                value={draftPriority}
-                onChange={(e) => setDraftPriority(e.target.value as Priority)}
-                className="rounded-lg border border-neutral-200 px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-400"
-              >
-                {(Object.keys(PRIORITY_META) as Priority[]).map((p) => (
-                  <option key={p} value={p}>
-                    {p} · {PRIORITY_META[p].label}
-                  </option>
-                ))}
-              </select>
-              <button
-                onClick={addDraftTask}
-                className="rounded-lg bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-neutral-700"
-              >
-                Agregar
+      {abierta !== null && (
+        <Detalle
+          mat={MATERIAS_BY_ID[abierta]}
+          s={st(abierta)}
+          i={info[abierta]}
+          info={info}
+          data={data}
+          update={(patch) => update(abierta, patch)}
+          onClose={() => setAbierta(null)}
+          onOpen={setAbierta}
+        />
+      )}
+    </main>
+  );
+}
+
+/* =========================================================================
+ * COMPONENTES
+ * ========================================================================= */
+
+function Bar({ pct, color, track }: { pct: number; color: string; track: string }) {
+  return (
+    <div className={`mt-3 h-3 w-full overflow-hidden rounded-full ${track}`}>
+      <div className={`h-full rounded-full ${color} transition-all duration-500`} style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function Stat({ label, value, hint }: { label: string; value: string | number; hint?: string }) {
+  return (
+    <div className="rounded-xl border border-neutral-200 bg-white px-4 py-3">
+      <p className="text-xs uppercase tracking-wider text-neutral-500">{label}</p>
+      <p className="text-2xl font-semibold tabular-nums">{value}</p>
+      {hint && <p className="text-[11px] text-neutral-400">{hint}</p>}
+    </div>
+  );
+}
+
+function Chips({ items, onOpen, data }: { items: Materia[]; onOpen: (id: number) => void; data: CarreraData }) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {items.map((mat) => (
+        <button
+          key={mat.id}
+          onClick={() => onOpen(mat.id)}
+          className={`rounded-full px-3 py-1 text-left text-sm transition-colors ${
+            mat.tup
+              ? "bg-indigo-100 text-indigo-900 ring-1 ring-indigo-300 hover:bg-indigo-200"
+              : "bg-neutral-100 text-neutral-700 hover:bg-neutral-200"
+          }`}
+        >
+          <span className="mr-1 font-mono text-xs opacity-60">{mat.id}</span>
+          {nombre(data, mat.id)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MateriaCard({
+  mat,
+  s,
+  i,
+  data,
+  onOpen,
+}: {
+  mat: Materia;
+  s: MateriaState;
+  i: Info;
+  data: CarreraData;
+  onOpen: () => void;
+}) {
+  const meta = VISTA_META[i.vista];
+  const base = mat.tup
+    ? "border-indigo-200 bg-indigo-50/70 border-l-4 border-l-indigo-500 hover:bg-indigo-100/70"
+    : "border-neutral-200 bg-white border-l-4 border-l-neutral-300 hover:bg-neutral-50";
+  const nota =
+    i.vista === "aprobada" || i.vista === "retenida"
+      ? s.notaFinal
+      : i.vista === "regular"
+        ? s.notaCursada
+        : undefined;
+
+  return (
+    <button
+      onClick={onOpen}
+      className={`flex w-full items-start gap-3 rounded-xl border p-3 text-left transition-colors ${base} ${
+        i.vista === "bloqueada" ? "opacity-55" : ""
+      }`}
+    >
+      <span
+        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full font-mono text-xs font-semibold ${
+          mat.tup ? "bg-indigo-600 text-white" : "bg-neutral-200 text-neutral-700"
+        }`}
+      >
+        {mat.id}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-medium leading-snug text-neutral-900">{nombre(data, mat.id)}</span>
+        <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${meta.pill}`}>
+            {etiqueta(s, i)}
+          </span>
+          {i.vista === "regular" && (
+            <span className="text-[11px] text-sky-700">{i.puedeRendir ? "puede rendir" : "final bloqueado"}</span>
+          )}
+          {mat.tup && <span className="text-[10px] font-semibold uppercase tracking-wider text-indigo-600">TUP</span>}
+          {i.inconsistente && (
+            <span className="text-[11px] text-rose-600" title="Cargaste avance sin cumplir las correlativas para cursar">
+              ⚠ correlativas
+            </span>
+          )}
+        </span>
+      </span>
+      {typeof nota === "number" && (
+        <span className={`text-lg font-semibold tabular-nums ${i.vista === "regular" ? "text-sky-700" : "text-emerald-700"}`}>
+          {nota}
+        </span>
+      )}
+    </button>
+  );
+}
+
+/* ---------------------- Panel de detalle / acciones ---------------------- */
+
+function Detalle({
+  mat,
+  s,
+  i,
+  info,
+  data,
+  update,
+  onClose,
+  onOpen,
+}: {
+  mat: Materia;
+  s: MateriaState;
+  i: Info;
+  info: Record<number, Info>;
+  data: CarreraData;
+  update: (patch: Partial<MateriaState>) => void;
+  onClose: () => void;
+  onOpen: (id: number) => void;
+}) {
+  const [nota, setNota] = useState<string>("");
+  const [fecha, setFecha] = useState<string>(hoy());
+  const [modo, setModo] = useState<null | "regular" | "promocion" | "final" | "libre" | "directa">(null);
+  const [recursaOpen, setRecursaOpen] = useState(false);
+  const [cicloCursado, setCicloCursado] = useState<string>(String(anioActual()));
+  const notaNum = nota === "" ? undefined : Number(nota);
+  const notaValida = notaNum !== undefined && notaNum >= 1 && notaNum <= 10;
+
+  const abrirForm = (m: typeof modo) => {
+    setModo(m);
+    setNota("");
+    setFecha(hoy());
+  };
+
+  const confirmar = () => {
+    if (modo === "regular") {
+      update({ estado: "regular", notaCursada: notaNum, fechaRegular: fecha });
+    } else if (modo === "promocion" || modo === "directa") {
+      if (!notaValida || notaNum! < NOTA_APROBACION) return;
+      update({ estado: "aprobada", via: modo === "promocion" ? "promocion" : "final", notaFinal: notaNum, fechaAprobada: fecha });
+    } else if (modo === "final" || modo === "libre") {
+      if (!notaValida) return;
+      const intento: Intento = { fecha, nota: notaNum!, tipo: modo === "final" ? "regular" : "libre" };
+      const intentos = [...s.intentos, intento];
+      if (notaNum! >= NOTA_APROBACION) {
+        update({ estado: "aprobada", via: modo === "final" ? "final" : "libre", notaFinal: notaNum, fechaAprobada: fecha, intentos });
+      } else {
+        update({ intentos });
+      }
+    }
+    setModo(null);
+  };
+
+  const deshacer = () => {
+    if (s.estado === "aprobada") {
+      // Si se aprobo por final, se quita el intento aprobado del historial
+      const intentos =
+        s.via === "promocion" ? s.intentos : s.intentos.filter((x, idx, arr) => !(idx === arr.length - 1 && x.nota >= NOTA_APROBACION));
+      const vuelta: Estado = s.via === "promocion" ? "cursando" : s.via === "libre" ? "libre" : s.fechaRegular ? "regular" : "pendiente";
+      update({ estado: vuelta, via: undefined, notaFinal: undefined, fechaAprobada: undefined, intentos });
+    } else if (s.estado === "regular") update({ estado: "cursando", notaCursada: undefined, fechaRegular: undefined });
+    else if (s.estado === "recursar") update({ estado: "cursando", cicloRecursa: undefined });
+    else if (s.estado === "cursando" || s.estado === "libre") update({ estado: "pendiente" });
+  };
+
+  const meta = VISTA_META[i.vista];
+  const Req = ({ ids, ok, label }: { ids: number[]; ok: (id: number) => boolean; label: string }) =>
+    ids.length === 0 ? null : (
+      <div>
+        <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-neutral-500">{label}</p>
+        <ul className="space-y-1">
+          {ids.map((id) => (
+            <li key={id}>
+              <button onClick={() => onOpen(id)} className="flex w-full items-center gap-2 text-left text-sm hover:underline">
+                <span className={ok(id) ? "text-emerald-600" : "text-rose-500"}>{ok(id) ? "✓" : "✗"}</span>
+                <span className="font-mono text-xs text-neutral-400">{id}</span>
+                <span className={MATERIAS_BY_ID[id].tup ? "text-indigo-900" : ""}>{nombre(data, id)}</span>
               </button>
-            </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    );
 
-            <div className="mt-4 space-y-2">
-              {tomorrowDraft.map((task) => (
-                <div
-                  key={task.id}
-                  className="flex items-center justify-between gap-3 rounded-lg border border-neutral-100 px-3 py-2"
-                >
-                  <span className="truncate text-sm">{task.text}</span>
-                  <div className="flex flex-shrink-0 items-center gap-1">
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${PRIORITY_META[task.priority].badge}`}
-                    >
-                      {task.priority}
-                    </span>
+  const btn = "rounded-full px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-xs text-neutral-500">
+              Cód. {mat.id} · {ORDINAL[mat.anio]} año{" "}
+              {mat.tup && <span className="ml-1 rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] font-semibold text-white">TUP</span>}
+            </p>
+            <h3 className="font-serif text-xl font-semibold leading-tight">{nombre(data, mat.id)}</h3>
+            <span className={`mt-2 inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${meta.pill}`}>
+              {i.vista === "aprobada" && s.via
+                ? `Aprobada · ${s.via === "promocion" ? "promoción" : s.via === "libre" ? "final libre" : "final"}`
+                : etiqueta(s, i)}
+            </span>
+          </div>
+          <button onClick={onClose} className="rounded-full px-2 text-2xl leading-none text-neutral-400 hover:text-neutral-800" aria-label="Cerrar">
+            ×
+          </button>
+        </div>
+
+        {mat.electiva && (
+          <label className="mt-4 block text-sm">
+            <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">Nombre de la electiva</span>
+            <input
+              value={s.nombre ?? ""}
+              onChange={(e) => update({ nombre: e.target.value })}
+              placeholder="Ej: Machine Learning"
+              className="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2"
+            />
+          </label>
+        )}
+
+        {/* ---- Avisos ---- */}
+        {i.vista === "retenida" && (
+          <p className="mt-4 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-900">
+            La nota está cargada, pero la aprobación no cuenta hasta aprobar: {i.faltaRendir.map((r) => r).join(", ")}.
+          </p>
+        )}
+        {i.inconsistente && (
+          <p className="mt-4 rounded-lg bg-rose-50 p-3 text-sm text-rose-800">
+            ⚠ Tenés avance cargado pero no se cumplen las correlativas para cursar. Revisá: {i.faltaCursar.join(" · ")}.
+          </p>
+        )}
+
+        {/* ---- Acciones segun estado ---- */}
+        <div className="mt-5 space-y-3">
+          {s.estado === "pendiente" &&
+            (i.puedeCursar ? (
+              <div className="flex flex-wrap gap-2">
+                <button className={`${btn} bg-amber-400 text-amber-950 hover:bg-amber-300`} onClick={() => update({ estado: "cursando" })}>
+                  Empezar a cursar
+                </button>
+                <button className={`${btn} border border-neutral-300 hover:bg-neutral-100`} onClick={() => abrirForm("directa")}>
+                  Ya la tengo aprobada
+                </button>
+              </div>
+            ) : (
+              <div className="rounded-lg bg-neutral-100 p-3 text-sm text-neutral-700">
+                <p className="font-medium">Bloqueada. Para cursarla te falta:</p>
+                <ul className="mt-1 list-inside list-disc">
+                  {i.faltaCursar.map((f) => (
+                    <li key={f}>{f}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+
+          {s.estado === "cursando" && (
+            <div>
+              <p className="mb-2 text-sm text-neutral-600">¿Cómo terminaste la cursada?</p>
+              <div className="flex flex-wrap gap-2">
+                <button className={`${btn} bg-sky-600 text-white hover:bg-sky-500`} onClick={() => abrirForm("regular")}>
+                  Regular
+                </button>
+                <button className={`${btn} bg-emerald-600 text-white hover:bg-emerald-500`} onClick={() => abrirForm("promocion")}>
+                  Promocional
+                </button>
+                <button className={`${btn} bg-rose-600 text-white hover:bg-rose-500`} onClick={() => update({ estado: "libre" })}>
+                  Libre
+                </button>
+                <button className={`${btn} bg-orange-500 text-white hover:bg-orange-400`} onClick={() => setRecursaOpen(true)}>
+                  Recursar
+                </button>
+              </div>
+              {recursaOpen && (
+                <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 p-3">
+                  <p className="mb-2 text-sm text-orange-900">
+                    Recursar: no vas a poder cursarla de nuevo hasta el ciclo lectivo siguiente.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <label>
+                      Ciclo lectivo que cursaste{" "}
+                      <input
+                        type="number"
+                        min={2000}
+                        max={2100}
+                        value={cicloCursado}
+                        onChange={(e) => setCicloCursado(e.target.value)}
+                        className="ml-1 w-20 rounded-lg border border-neutral-300 px-2 py-1"
+                      />
+                    </label>
                     <button
-                      onClick={() => removeDraftTask(task.id)}
-                      className="flex h-9 w-9 flex-shrink-0 items-center justify-center text-lg text-neutral-300 transition-colors hover:text-neutral-600"
-                      aria-label="Quitar"
+                      className={`${btn} bg-orange-500 text-white hover:bg-orange-400`}
+                      disabled={!/^\d{4}$/.test(cicloCursado)}
+                      onClick={() => {
+                        update({ estado: "recursar", cicloRecursa: Number(cicloCursado) + 1 });
+                        setRecursaOpen(false);
+                      }}
                     >
-                      &times;
+                      Confirmar
+                    </button>
+                    <button className="text-sm text-neutral-500 hover:text-neutral-800" onClick={() => setRecursaOpen(false)}>
+                      Cancelar
                     </button>
                   </div>
                 </div>
-              ))}
-              {tomorrowDraft.length === 0 && (
-                <p className="py-4 text-center text-sm text-neutral-400">
-                  Todavia no planificaste nada para manana.
-                </p>
               )}
             </div>
+          )}
 
-            <div className="mt-6 flex items-center justify-between gap-3">
-              <button
-                onClick={() => setIsDayCloseOpen(false)}
-                className="rounded-full border border-neutral-200 px-4 py-2 text-sm text-neutral-600 transition-colors hover:bg-neutral-50"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={confirmDayClose}
-                disabled={!canConfirmClose}
-                className="rounded-full bg-neutral-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:bg-neutral-200 disabled:text-neutral-400"
-              >
-                Confirmar cierre ({tomorrowDraft.length}/3)
-              </button>
+          {s.estado === "recursar" && (
+            <div className="space-y-2">
+              {i.vista === "recursar" ? (
+                <p className="rounded-lg bg-orange-50 p-3 text-sm text-orange-900">
+                  Tenés que recursarla. Vas a poder cursarla de nuevo desde el ciclo lectivo <b>{s.cicloRecursa}</b>.
+                </p>
+              ) : !i.puedeCursar ? (
+                <div className="rounded-lg bg-neutral-100 p-3 text-sm text-neutral-700">
+                  <p className="font-medium">Ya empezó el ciclo {s.cicloRecursa}, pero para recursarla te falta:</p>
+                  <ul className="mt-1 list-inside list-disc">
+                    {i.faltaCursar.map((f) => (
+                      <li key={f}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <p className="text-sm text-orange-900">Ya podés volver a cursarla en el ciclo {s.cicloRecursa}.</p>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className={`${btn} bg-amber-400 text-amber-950 hover:bg-amber-300`}
+                  disabled={i.vista !== "disponible"}
+                  onClick={() => update({ estado: "cursando", cicloRecursa: undefined })}
+                >
+                  Volver a cursar
+                </button>
+                <label className="text-sm text-neutral-600">
+                  Habilitada desde{" "}
+                  <input
+                    type="number"
+                    min={2000}
+                    max={2100}
+                    value={s.cicloRecursa ?? ""}
+                    onChange={(e) => update({ cicloRecursa: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className="ml-1 w-20 rounded-lg border border-neutral-300 px-2 py-1"
+                  />
+                </label>
+              </div>
             </div>
+          )}
+
+          {(s.estado === "regular" || s.estado === "libre") && (
+            <div className="space-y-2">
+              {!i.puedeRendir && (
+                <p className="rounded-lg bg-sky-50 p-3 text-sm text-sky-900">
+                  Todavía no podés rendir el final. Tenés que aprobar antes:{" "}
+                  {i.faltaRendir.map((r) => `${r} · ${nombre(data, r)}`).join(", ")}.
+                </p>
+              )}
+              {s.estado === "regular" && i.puedeRendir && (
+                <p className="text-sm text-sky-800">
+                  Regularizada{s.fechaRegular ? ` el ${s.fechaRegular}` : ""}. Ya cuenta como correlativa débil para cursar.
+                </p>
+              )}
+              <div className="flex flex-wrap gap-2">
+                {s.estado === "regular" ? (
+                  <>
+                    <button className={`${btn} bg-emerald-600 text-white hover:bg-emerald-500`} disabled={!i.puedeRendir} onClick={() => abrirForm("final")}>
+                      Registrar final
+                    </button>
+                    <button className={`${btn} border border-rose-300 text-rose-700 hover:bg-rose-50`} onClick={() => update({ estado: "libre" })}>
+                      Perdí la regularidad
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className={`${btn} bg-amber-400 text-amber-950 hover:bg-amber-300`} onClick={() => update({ estado: "cursando" })}>
+                      Volver a cursar
+                    </button>
+                    <button className={`${btn} bg-emerald-600 text-white hover:bg-emerald-500`} disabled={!i.puedeRendir} onClick={() => abrirForm("libre")}>
+                      Rendir libre
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+
+          {s.estado === "aprobada" && (
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm">
+                Nota{" "}
+                <input
+                  type="number"
+                  min={NOTA_APROBACION}
+                  max={10}
+                  value={s.notaFinal ?? ""}
+                  onChange={(e) => update({ notaFinal: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  className="ml-1 w-16 rounded-lg border border-neutral-300 px-2 py-1"
+                />
+              </label>
+              <label className="text-sm">
+                Fecha{" "}
+                <input
+                  type="date"
+                  value={s.fechaAprobada ?? ""}
+                  onChange={(e) => update({ fechaAprobada: e.target.value })}
+                  className="ml-1 rounded-lg border border-neutral-300 px-2 py-1"
+                />
+              </label>
+            </div>
+          )}
+
+          {/* ---- Formulario de nota ---- */}
+          {modo && (
+            <div className="rounded-xl border border-neutral-200 bg-neutral-50 p-3">
+              <p className="mb-2 text-sm font-medium">
+                {modo === "regular" && "Regularizar (nota de cursada opcional)"}
+                {modo === "promocion" && "Promoción: nota final"}
+                {modo === "final" && "Final (si sacás menos de 4 queda como aplazo)"}
+                {modo === "libre" && "Final libre (si sacás menos de 4 queda como aplazo)"}
+                {modo === "directa" && "Cargar como aprobada (historial)"}
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="number"
+                  min={1}
+                  max={10}
+                  step="0.5"
+                  autoFocus
+                  placeholder="Nota"
+                  value={nota}
+                  onChange={(e) => setNota(e.target.value)}
+                  className="w-20 rounded-lg border border-neutral-300 px-2 py-1.5"
+                />
+                <input type="date" value={fecha} onChange={(e) => setFecha(e.target.value)} className="rounded-lg border border-neutral-300 px-2 py-1.5" />
+                <button
+                  className={`${btn} bg-neutral-900 text-white hover:bg-neutral-700`}
+                  disabled={
+                    modo === "regular"
+                      ? nota !== "" && !notaValida
+                      : !notaValida || ((modo === "promocion" || modo === "directa") && notaNum! < NOTA_APROBACION)
+                  }
+                  onClick={confirmar}
+                >
+                  Guardar
+                </button>
+                <button className="text-sm text-neutral-500 hover:text-neutral-800" onClick={() => setModo(null)}>
+                  Cancelar
+                </button>
+              </div>
+            </div>
+          )}
+
+          {s.estado !== "pendiente" && (
+            <button onClick={deshacer} className="text-xs text-neutral-500 underline hover:text-neutral-800">
+              Deshacer último paso
+            </button>
+          )}
+        </div>
+
+        {/* ---- Historial de finales ---- */}
+        {s.intentos.length > 0 && (
+          <div className="mt-5">
+            <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-neutral-500">Finales rendidos</p>
+            <ul className="divide-y divide-neutral-100 text-sm">
+              {s.intentos.map((x, idx) => (
+                <li key={idx} className="flex items-center justify-between py-1.5">
+                  <span>
+                    {x.fecha} · {x.tipo === "libre" ? "libre" : "regular"}
+                  </span>
+                  <span className="flex items-center gap-3">
+                    <span className={`font-semibold ${x.nota >= NOTA_APROBACION ? "text-emerald-700" : "text-rose-600"}`}>{x.nota}</span>
+                    <button
+                      className="text-neutral-400 hover:text-rose-600"
+                      aria-label="Borrar intento"
+                      onClick={() => update({ intentos: s.intentos.filter((_, j) => j !== idx) })}
+                    >
+                      ×
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* ---- Correlatividades ---- */}
+        <div className="mt-6 grid gap-4 border-t border-neutral-100 pt-4 sm:grid-cols-2">
+          <Req ids={mat.cursada} ok={(id) => info[id].regularizada} label="Para cursar · regularizada" />
+          <Req ids={mat.rendida} ok={(id) => info[id].aprobada} label="Para cursar · aprobada" />
+          {mat.id !== 39 && <Req ids={mat.rendir} ok={(id) => info[id].aprobada} label="Para rendir · aprobada" />}
+          {mat.id === 39 && (
+            <p className="text-sm text-neutral-600 sm:col-span-2">
+              Para rendir: todas las materias 1 a 38 aprobadas ({mat.rendir.filter((r) => info[r].aprobada).length}/38).
+            </p>
+          )}
+          <Req ids={HABILITA[mat.id]} ok={(id) => info[id].puedeCursar} label="Habilita a cursar" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------- Google Sheets: estado y configuracion ---------------------- */
+
+const SYNC_META: Record<SyncStatus, { label: string; cls: string }> = {
+  off: { label: "Conectar Google Sheets", cls: "border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100" },
+  conectando: { label: "Conectando…", cls: "border-neutral-300 bg-white text-neutral-600" },
+  ok: { label: "Guardado en Sheets", cls: "border-emerald-300 bg-white text-emerald-700 hover:bg-emerald-50" },
+  guardando: { label: "Guardando…", cls: "border-neutral-300 bg-white text-neutral-600" },
+  pendiente: { label: "Sin conexión · cambios pendientes", cls: "border-amber-300 bg-amber-50 text-amber-800" },
+  error: { label: "Error al sincronizar", cls: "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100" },
+};
+
+function SyncPill({ status, lastSync, onClick }: { status: SyncStatus; lastSync: Date | null; onClick: () => void }) {
+  const meta = SYNC_META[status];
+  return (
+    <button onClick={onClick} className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm ${meta.cls}`}>
+      <span aria-hidden>{status === "ok" ? "✓" : status === "error" ? "!" : "☁"}</span>
+      {meta.label}
+      {status === "ok" && lastSync && (
+        <span className="text-xs opacity-70">{lastSync.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })}</span>
+      )}
+    </button>
+  );
+}
+
+const SCRIPT_URL = "https://github.com/Hernan-carrion/personal-tracker-dashboard/blob/main/apps-script/Code.gs";
+
+function SyncModal({
+  cfg,
+  status,
+  error,
+  onSave,
+  onSyncNow,
+  onClose,
+}: {
+  cfg: SyncConfig | null;
+  status: SyncStatus;
+  error: string | null;
+  onSave: (c: SyncConfig | null) => void;
+  onSyncNow: () => void;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState(cfg?.url ?? "");
+  const [token, setToken] = useState(cfg?.token ?? "");
+  const [probando, setProbando] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const urlValida = /^https:\/\/script\.google\.com\/.+\/exec$/.test(url.trim());
+
+  const conectar = async () => {
+    const c = { url: url.trim(), token: token.trim() };
+    setProbando(true);
+    setMsg(null);
+    try {
+      await probarConexion(c);
+      onSave(c);
+      onClose();
+    } catch (err) {
+      setMsg(errorLegible(err));
+    } finally {
+      setProbando(false);
+    }
+  };
+
+  const btn = "rounded-full px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <h3 className="font-serif text-xl font-semibold">Guardar en Google Sheets</h3>
+          <button onClick={onClose} className="rounded-full px-2 text-2xl leading-none text-neutral-400 hover:text-neutral-800" aria-label="Cerrar">
+            ×
+          </button>
+        </div>
+
+        {cfg && (
+          <div className={`mt-3 rounded-lg p-3 text-sm ${status === "error" ? "bg-rose-50 text-rose-800" : "bg-emerald-50 text-emerald-900"}`}>
+            {status === "error" ? error : SYNC_META[status].label}
+          </div>
+        )}
+
+        <ol className="mt-4 list-inside list-decimal space-y-1 text-sm text-neutral-700">
+          <li>
+            Creá un Google Sheet nuevo → <b>Extensiones → Apps Script</b>.
+          </li>
+          <li>
+            Pegá el contenido de{" "}
+            <a href={SCRIPT_URL} target="_blank" rel="noreferrer" className="text-indigo-700 underline">
+              apps-script/Code.gs
+            </a>{" "}
+            y cambiá <code className="rounded bg-neutral-100 px-1">TOKEN</code> por una clave tuya.
+          </li>
+          <li>
+            <b>Implementar → Nueva implementación → Aplicación web</b>. Ejecutar como: <i>Yo</i>. Acceso: <i>Cualquier usuario</i>.
+          </li>
+          <li>
+            Copiá la URL (termina en <code className="rounded bg-neutral-100 px-1">/exec</code>) y pegala acá con la misma clave.
+          </li>
+        </ol>
+
+        <div className="mt-4 space-y-3">
+          <label className="block text-sm">
+            <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">URL de la aplicación web</span>
+            <input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://script.google.com/macros/s/…/exec"
+              className="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 font-mono text-xs"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">Clave (TOKEN)</span>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2"
+            />
+          </label>
+          {url && !urlValida && (
+            <p className="text-xs text-rose-600">La URL debería empezar con https://script.google.com/ y terminar en /exec.</p>
+          )}
+          {msg && <p className="rounded-lg bg-rose-50 p-3 text-sm text-rose-800">{msg}</p>}
+          <p className="text-xs text-neutral-500">
+            La URL y la clave quedan guardadas solo en este navegador. Repetí este paso en cada dispositivo (celular, compu) con los
+            mismos datos.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className={`${btn} bg-emerald-600 text-white hover:bg-emerald-500`}
+              disabled={!urlValida || !token.trim() || probando}
+              onClick={conectar}
+            >
+              {probando ? "Probando…" : cfg ? "Guardar cambios" : "Conectar"}
+            </button>
+            {cfg && (
+              <>
+                <button className={`${btn} border border-neutral-300 hover:bg-neutral-100`} onClick={onSyncNow}>
+                  Sincronizar ahora
+                </button>
+                <button
+                  className={`${btn} border border-rose-300 text-rose-700 hover:bg-rose-50`}
+                  onClick={() => {
+                    onSave(null);
+                    onClose();
+                  }}
+                >
+                  Desconectar
+                </button>
+              </>
+            )}
           </div>
         </div>
-      )}
-    </main>
+      </div>
+    </div>
   );
 }

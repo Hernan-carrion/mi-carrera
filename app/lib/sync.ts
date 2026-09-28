@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useLocalStorage } from "../lib/useLocalStorage";
+import { useLocalStorage } from "./useLocalStorage";
 
 /* =========================================================================
  * SINCRONIZACION CON GOOGLE SHEETS (via Apps Script, ver apps-script/Code.gs)

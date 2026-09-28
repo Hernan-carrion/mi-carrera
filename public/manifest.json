@@ -1,7 +1,7 @@
 {
-  "name": "Personal Tracker Dashboard",
-  "short_name": "Tracker",
-  "description": "Agenda personal con la metodologia de Brian Tracy y un tracker de habitos circular.",
+  "name": "Mi Carrera",
+  "short_name": "Mi Carrera",
+  "description": "Seguimiento de la Lic. en Ciencias de la Computacion (UNSJ) y la TUP, con correlatividades automaticas.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

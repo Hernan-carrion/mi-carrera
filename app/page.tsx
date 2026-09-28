@@ -1,40 +1,8 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-
-/* =========================================================================
- * PERSISTENCIA LOCAL (localStorage)
- * La app no tiene backend: todo vive en el navegador del celular/PC donde
- * se abre. Cada valor se guarda bajo su propia clave para poder cargarlos
- * de forma independiente.
- * ========================================================================= */
-
-function useLocalStorage<T>(key: string, initialValue: T) {
-  const [value, setValue] = useState<T>(initialValue);
-  const [hydrated, setHydrated] = useState(false);
-
-  useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(key);
-      if (raw !== null) setValue(JSON.parse(raw) as T);
-    } catch {
-      // localStorage no disponible (modo privado, SSR, etc.) - se ignora
-    }
-    setHydrated(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    try {
-      window.localStorage.setItem(key, JSON.stringify(value));
-    } catch {
-      // almacenamiento lleno o bloqueado - se ignora
-    }
-  }, [key, value, hydrated]);
-
-  return [value, setValue] as const;
-}
+import { useLocalStorage } from "./lib/useLocalStorage";
 
 /* =========================================================================
  * TIPOS Y DATOS BASE
@@ -320,6 +288,13 @@ export default function Home() {
                   })
                 : ""}
             </p>
+            <div className="flex flex-wrap gap-2">
+            <Link
+              href="/carrera"
+              className="inline-flex items-center gap-2 rounded-full border border-neutral-300 bg-white px-5 py-2.5 text-sm font-medium text-neutral-800 transition-colors hover:bg-neutral-100"
+            >
+              Mi Carrera
+            </Link>
             <button
               onClick={() => setIsDayCloseOpen(true)}
               className="inline-flex items-center gap-2 rounded-full bg-neutral-900 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-neutral-700 active:bg-neutral-800"
@@ -327,6 +302,7 @@ export default function Home() {
               <span className="sm:hidden">Cierre de Dia</span>
               <span className="hidden sm:inline">Cierre de Dia · Regla 10/90</span>
             </button>
+            </div>
           </div>
         </header>
 

@@ -19,6 +19,14 @@ navegador donde se abre.
   trigonometria (`Math.sin`/`Math.cos`). Cada mes arranca con su propia
   grilla en blanco.
 - **Notas** con fondo de grilla sutil.
+- **Mi Carrera** (`/carrera`): seguimiento de la Lic. en Ciencias de la
+  Computacion (UNSJ, Ord. 10/2022) y su titulo intermedio TUP. Las materias
+  se habilitan/bloquean solas segun las correlatividades de la Res.
+  109/2022 (`app/carrera/plan.ts`): regularizar alcanza para cursar las
+  correlativas debiles, y el final solo se habilita con las correlativas
+  para rendir aprobadas. Estados: cursando → regular / promocional / libre,
+  carga de notas de cursada y finales (con aplazos), % de TUP y de
+  Licenciatura, y backup exportable a JSON.
 
 Todo el estado (tareas, objetivos, marcas del tracker, notas) persiste en
 `localStorage`, asi que sobrevive a cerrar la pestana o el navegador. Es

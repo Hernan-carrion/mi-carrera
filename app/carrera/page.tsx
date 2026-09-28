@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo, useRef, useState } from "react";
 import { useLocalStorage } from "../lib/useLocalStorage";
 import { MATERIAS_BY_ID, Materia, NOTA_APROBACION, PLAN, TUP_IDS } from "./plan";
+import { SyncConfig, SyncStatus, errorLegible, probarConexion, useSheetSync } from "./sync";
 
 /* =========================================================================
  * ESTADO GUARDADO POR MATERIA
@@ -35,6 +36,7 @@ interface MateriaState {
 interface CarreraData {
   materias: Record<number, MateriaState>;
   practica: boolean;
+  updatedAt?: number; // para resolver que version gana al sincronizar
 }
 
 const EMPTY: CarreraData = { materias: {}, practica: false };
@@ -138,7 +140,9 @@ type Filtro = "todas" | "tup" | "accion";
  * ========================================================================= */
 
 export default function CarreraPage() {
-  const [data, setData, hydrated] = useLocalStorage<CarreraData>("carrera.v1", EMPTY);
+  const [data, setRaw, hydrated] = useLocalStorage<CarreraData>("carrera.v1", EMPTY);
+  const setData = (fn: (d: CarreraData) => CarreraData) => setRaw((d) => ({ ...fn(d), updatedAt: Date.now() }));
+  const [syncOpen, setSyncOpen] = useState(false);
   const [filtro, setFiltro] = useLocalStorage<Filtro>("carrera.filtro", "todas");
   const [abierta, setAbierta] = useState<number | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -195,6 +199,43 @@ export default function CarreraPage() {
     return { finales: puedeRendirYa.sort(orden), cursar: paraCursar.sort(orden) };
   }, [info]);
 
+  // ---- Google Sheets ----
+  const sync = useSheetSync(data, setRaw, hydrated, () => ({
+    filas: [
+      ["Código", "Materia", "Año", "TUP", "Estado", "Vía", "Nota cursada", "Fecha regular", "Nota final", "Fecha aprobada", "Finales rendidos"],
+      ...PLAN.map((mat) => {
+        const s = st(mat.id);
+        const v = info[mat.id].vista;
+        return [
+          mat.id,
+          nombre(data, mat.id),
+          mat.anio,
+          mat.tup ? "Sí" : "",
+          v === "aprobada" && s.via === "promocion" ? "Promocionada" : VISTA_META[v].label,
+          s.estado === "aprobada" ? s.via ?? "" : "",
+          s.notaCursada ?? "",
+          s.fechaRegular ?? "",
+          s.estado === "aprobada" ? s.notaFinal ?? "" : "",
+          s.estado === "aprobada" ? s.fechaAprobada ?? "" : "",
+          s.intentos.map((x) => `${x.fecha}: ${x.nota}${x.tipo === "libre" ? " (libre)" : ""}`).join("; "),
+        ];
+      }),
+    ],
+    resumen: [
+      ["Indicador", "Valor"],
+      ["TUP %", Math.round(stats.tupPct)],
+      ["TUP materias aprobadas", `${stats.tupAprob}/${TUP_IDS.length}`],
+      ["Práctica Socio-Educativa", data.practica ? "Cumplida" : "Pendiente"],
+      ["Licenciatura %", Math.round(stats.licPct)],
+      ["Licenciatura materias aprobadas", `${stats.aprobadas}/${PLAN.length}`],
+      ["Promedio (sin aplazos)", stats.promedio !== null ? Number(stats.promedio.toFixed(2)) : ""],
+      ["Promedio (con aplazos)", stats.promedioAplazos !== null ? Number(stats.promedioAplazos.toFixed(2)) : ""],
+      ["Regulares", stats.regulares],
+      ["Cursando", stats.cursando],
+      ["Actualizado", new Date(data.updatedAt ?? Date.now()).toLocaleString("es-AR")],
+    ],
+  }));
+
   const visible = (mat: Materia) => {
     if (filtro === "tup") return mat.tup;
     if (filtro === "accion") return !["aprobada", "bloqueada"].includes(info[mat.id].vista);
@@ -214,7 +255,7 @@ export default function CarreraPage() {
     try {
       const parsed = JSON.parse(await file.text()) as CarreraData;
       if (!parsed || typeof parsed.materias !== "object") throw new Error();
-      setData({ materias: parsed.materias, practica: !!parsed.practica });
+      setData(() => ({ materias: parsed.materias, practica: !!parsed.practica }));
     } catch {
       alert("El archivo no es un backup válido.");
     }
@@ -235,6 +276,7 @@ export default function CarreraPage() {
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
+            <SyncPill status={sync.status} lastSync={sync.lastSync} onClick={() => setSyncOpen(true)} />
             <button onClick={exportar} className="rounded-full border border-neutral-300 bg-white px-4 py-2 text-sm hover:bg-neutral-100">
               Exportar backup
             </button>
@@ -389,6 +431,17 @@ export default function CarreraPage() {
           pasarlos a otro dispositivo.
         </p>
       </div>
+
+      {syncOpen && (
+        <SyncModal
+          cfg={sync.cfg}
+          status={sync.status}
+          error={sync.error}
+          onSave={(c) => sync.setCfg(c)}
+          onSyncNow={sync.sincronizar}
+          onClose={() => setSyncOpen(false)}
+        />
+      )}
 
       {abierta !== null && (
         <Detalle
@@ -830,6 +883,167 @@ function Detalle({
             </p>
           )}
           <Req ids={HABILITA[mat.id]} ok={(id) => info[id].puedeCursar} label="Habilita a cursar" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------- Google Sheets: estado y configuracion ---------------------- */
+
+const SYNC_META: Record<SyncStatus, { label: string; cls: string }> = {
+  off: { label: "Conectar Google Sheets", cls: "border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100" },
+  conectando: { label: "Conectando…", cls: "border-neutral-300 bg-white text-neutral-600" },
+  ok: { label: "Guardado en Sheets", cls: "border-emerald-300 bg-white text-emerald-700 hover:bg-emerald-50" },
+  guardando: { label: "Guardando…", cls: "border-neutral-300 bg-white text-neutral-600" },
+  pendiente: { label: "Sin conexión · cambios pendientes", cls: "border-amber-300 bg-amber-50 text-amber-800" },
+  error: { label: "Error al sincronizar", cls: "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100" },
+};
+
+function SyncPill({ status, lastSync, onClick }: { status: SyncStatus; lastSync: Date | null; onClick: () => void }) {
+  const meta = SYNC_META[status];
+  return (
+    <button onClick={onClick} className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 text-sm ${meta.cls}`}>
+      <span aria-hidden>{status === "ok" ? "✓" : status === "error" ? "!" : "☁"}</span>
+      {meta.label}
+      {status === "ok" && lastSync && (
+        <span className="text-xs opacity-70">{lastSync.toLocaleTimeString("es-AR", { hour: "2-digit", minute: "2-digit" })}</span>
+      )}
+    </button>
+  );
+}
+
+const SCRIPT_URL = "https://github.com/Hernan-carrion/personal-tracker-dashboard/blob/main/apps-script/Code.gs";
+
+function SyncModal({
+  cfg,
+  status,
+  error,
+  onSave,
+  onSyncNow,
+  onClose,
+}: {
+  cfg: SyncConfig | null;
+  status: SyncStatus;
+  error: string | null;
+  onSave: (c: SyncConfig | null) => void;
+  onSyncNow: () => void;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState(cfg?.url ?? "");
+  const [token, setToken] = useState(cfg?.token ?? "");
+  const [probando, setProbando] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const urlValida = /^https:\/\/script\.google\.com\/.+\/exec$/.test(url.trim());
+
+  const conectar = async () => {
+    const c = { url: url.trim(), token: token.trim() };
+    setProbando(true);
+    setMsg(null);
+    try {
+      await probarConexion(c);
+      onSave(c);
+      onClose();
+    } catch (err) {
+      setMsg(errorLegible(err));
+    } finally {
+      setProbando(false);
+    }
+  };
+
+  const btn = "rounded-full px-4 py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 sm:items-center sm:p-4" onClick={onClose}>
+      <div
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-2xl bg-white p-5 shadow-xl sm:rounded-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <h3 className="font-serif text-xl font-semibold">Guardar en Google Sheets</h3>
+          <button onClick={onClose} className="rounded-full px-2 text-2xl leading-none text-neutral-400 hover:text-neutral-800" aria-label="Cerrar">
+            ×
+          </button>
+        </div>
+
+        {cfg && (
+          <div className={`mt-3 rounded-lg p-3 text-sm ${status === "error" ? "bg-rose-50 text-rose-800" : "bg-emerald-50 text-emerald-900"}`}>
+            {status === "error" ? error : SYNC_META[status].label}
+          </div>
+        )}
+
+        <ol className="mt-4 list-inside list-decimal space-y-1 text-sm text-neutral-700">
+          <li>
+            Creá un Google Sheet nuevo → <b>Extensiones → Apps Script</b>.
+          </li>
+          <li>
+            Pegá el contenido de{" "}
+            <a href={SCRIPT_URL} target="_blank" rel="noreferrer" className="text-indigo-700 underline">
+              apps-script/Code.gs
+            </a>{" "}
+            y cambiá <code className="rounded bg-neutral-100 px-1">TOKEN</code> por una clave tuya.
+          </li>
+          <li>
+            <b>Implementar → Nueva implementación → Aplicación web</b>. Ejecutar como: <i>Yo</i>. Acceso: <i>Cualquier usuario</i>.
+          </li>
+          <li>
+            Copiá la URL (termina en <code className="rounded bg-neutral-100 px-1">/exec</code>) y pegala acá con la misma clave.
+          </li>
+        </ol>
+
+        <div className="mt-4 space-y-3">
+          <label className="block text-sm">
+            <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">URL de la aplicación web</span>
+            <input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://script.google.com/macros/s/…/exec"
+              className="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2 font-mono text-xs"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="text-xs font-semibold uppercase tracking-wider text-neutral-500">Clave (TOKEN)</span>
+            <input
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              className="mt-1 w-full rounded-lg border border-neutral-300 px-3 py-2"
+            />
+          </label>
+          {url && !urlValida && (
+            <p className="text-xs text-rose-600">La URL debería empezar con https://script.google.com/ y terminar en /exec.</p>
+          )}
+          {msg && <p className="rounded-lg bg-rose-50 p-3 text-sm text-rose-800">{msg}</p>}
+          <p className="text-xs text-neutral-500">
+            La URL y la clave quedan guardadas solo en este navegador. Repetí este paso en cada dispositivo (celular, compu) con los
+            mismos datos.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              className={`${btn} bg-emerald-600 text-white hover:bg-emerald-500`}
+              disabled={!urlValida || !token.trim() || probando}
+              onClick={conectar}
+            >
+              {probando ? "Probando…" : cfg ? "Guardar cambios" : "Conectar"}
+            </button>
+            {cfg && (
+              <>
+                <button className={`${btn} border border-neutral-300 hover:bg-neutral-100`} onClick={onSyncNow}>
+                  Sincronizar ahora
+                </button>
+                <button
+                  className={`${btn} border border-rose-300 text-rose-700 hover:bg-rose-50`}
+                  onClick={() => {
+                    onSave(null);
+                    onClose();
+                  }}
+                >
+                  Desconectar
+                </button>
+              </>
+            )}
+          </div>
         </div>
       </div>
     </div>

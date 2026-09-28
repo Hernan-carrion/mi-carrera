@@ -26,7 +26,35 @@ navegador donde se abre.
   correlativas debiles, y el final solo se habilita con las correlativas
   para rendir aprobadas. Estados: cursando → regular / promocional / libre,
   carga de notas de cursada y finales (con aplazos), % de TUP y de
-  Licenciatura, y backup exportable a JSON.
+  Licenciatura, y backup exportable a JSON. Opcionalmente se sincroniza
+  con Google Sheets (ver abajo).
+
+## Sincronizar "Mi Carrera" con Google Sheets
+
+Para no depender del `localStorage` (y tener los mismos datos en el
+celular y la compu), la seccion de carrera puede guardarse en un Google
+Sheet propio a traves de un Apps Script:
+
+1. Crear un Google Sheet nuevo → **Extensiones → Apps Script**.
+2. Pegar el contenido de [`apps-script/Code.gs`](apps-script/Code.gs) y
+   cambiar `TOKEN` por una clave propia. Guardar.
+3. **Implementar → Nueva implementacion → Aplicacion web**, con
+   *Ejecutar como: Yo* y *Quien tiene acceso: Cualquier usuario*.
+   Autorizar los permisos que pide Google.
+4. Copiar la URL de la aplicacion web (termina en `/exec`).
+5. En la pagina, **Conectar Google Sheets** → pegar la URL y la clave.
+   Repetir en cada dispositivo.
+
+La pagina guarda cada cambio en la hoja (a los ~1.5 s) y al abrirse, o al
+volver a la pestana, trae la version mas nueva. Si no hay conexion sigue
+funcionando con la copia local y sube los cambios despues. La hoja
+`Materias` tiene una fila por materia, `Resumen` los porcentajes y
+promedios, y `_raw` (oculta) el estado completo que lee la pagina.
+
+La URL y la clave se guardan solo en el navegador, nunca en el repo. Si
+se cambia el codigo del script hay que crear una **nueva version** de la
+implementacion (Implementar → Gestionar implementaciones) para que tome
+efecto.
 
 Todo el estado (tareas, objetivos, marcas del tracker, notas) persiste en
 `localStorage`, asi que sobrevive a cerrar la pestana o el navegador. Es

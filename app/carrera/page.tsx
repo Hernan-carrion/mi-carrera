@@ -13,7 +13,7 @@ import { SyncConfig, SyncStatus, errorLegible, probarConexion, useSheetSync } fr
  * partir de las correlatividades, nunca se guardan.
  * ========================================================================= */
 
-type Estado = "pendiente" | "cursando" | "regular" | "libre" | "aprobada";
+type Estado = "pendiente" | "cursando" | "regular" | "libre" | "recursar" | "aprobada";
 type Via = "final" | "promocion" | "libre";
 
 interface Intento {
@@ -31,6 +31,7 @@ interface MateriaState {
   fechaAprobada?: string;
   intentos: Intento[];
   nombre?: string; // nombre elegido para las electivas
+  cicloRecursa?: number; // recursada: año lectivo desde el que se puede volver a cursar
 }
 
 interface CarreraData {
@@ -43,6 +44,7 @@ const EMPTY: CarreraData = { materias: {}, practica: false };
 const DEFAULT_STATE: MateriaState = { estado: "pendiente", intentos: [] };
 
 const hoy = () => new Date().toISOString().slice(0, 10);
+const anioActual = () => new Date().getFullYear();
 
 /* =========================================================================
  * MOTOR DE CORRELATIVIDADES
@@ -54,6 +56,7 @@ type Vista =
   | "regular"
   | "cursando"
   | "libre"
+  | "recursar" // debe recursar y todavia no empezo el ciclo lectivo siguiente
   | "disponible"
   | "bloqueada";
 
@@ -92,6 +95,8 @@ function calcular(data: CarreraData): Record<number, Info> {
     let vista: Vista;
     if (s.estado === "aprobada") vista = aprobada ? "aprobada" : "retenida";
     else if (s.estado === "pendiente") vista = puedeCursar ? "disponible" : "bloqueada";
+    else if (s.estado === "recursar")
+      vista = anioActual() < (s.cicloRecursa ?? 0) ? "recursar" : puedeCursar ? "disponible" : "bloqueada";
     else vista = s.estado;
 
     const inconsistente =
@@ -100,6 +105,14 @@ function calcular(data: CarreraData): Record<number, Info> {
     out[mat.id] = { vista, aprobada, regularizada, puedeCursar, puedeRendir, faltaCursar, faltaRendir, inconsistente };
   }
   return out;
+}
+
+/** Texto del estado para mostrar (tarjeta, detalle y Google Sheets). */
+function etiqueta(s: MateriaState, i: Info) {
+  if (i.vista === "aprobada" && s.via === "promocion") return "Promocionada";
+  if (i.vista === "recursar") return `Recursar · desde ${s.cicloRecursa}`;
+  if (s.estado === "recursar") return `${VISTA_META[i.vista].label} · recursa`;
+  return VISTA_META[i.vista].label;
 }
 
 function nombre(data: CarreraData, id: number) {
@@ -126,6 +139,7 @@ const VISTA_META: Record<Vista, { label: string; pill: string }> = {
   regular: { label: "Regular", pill: "bg-sky-600 text-white" },
   cursando: { label: "Cursando", pill: "bg-amber-400 text-amber-950" },
   libre: { label: "Libre", pill: "bg-rose-600 text-white" },
+  recursar: { label: "Recursar", pill: "bg-orange-500 text-white" },
   disponible: { label: "Disponible", pill: "bg-white text-neutral-800 ring-1 ring-neutral-400" },
   bloqueada: { label: "Bloqueada", pill: "bg-neutral-200 text-neutral-500" },
 };
@@ -211,7 +225,7 @@ export default function CarreraPage() {
           nombre(data, mat.id),
           mat.anio,
           mat.tup ? "Sí" : "",
-          v === "aprobada" && s.via === "promocion" ? "Promocionada" : VISTA_META[v].label,
+          etiqueta(s, info[mat.id]),
           s.estado === "aprobada" ? s.via ?? "" : "",
           s.notaCursada ?? "",
           s.fechaRegular ?? "",
@@ -395,7 +409,7 @@ export default function CarreraPage() {
           </div>
           <div className="flex flex-wrap gap-1.5 text-xs">
             <span className="rounded-full bg-indigo-600 px-2 py-0.5 font-semibold text-white">TUP</span>
-            {(["aprobada", "regular", "cursando", "libre", "disponible", "bloqueada"] as Vista[]).map((v) => (
+            {(["aprobada", "regular", "cursando", "libre", "recursar", "disponible", "bloqueada"] as Vista[]).map((v) => (
               <span key={v} className={`rounded-full px-2 py-0.5 ${VISTA_META[v].pill}`}>
                 {VISTA_META[v].label}
               </span>
@@ -544,7 +558,7 @@ function MateriaCard({
         <span className="block text-sm font-medium leading-snug text-neutral-900">{nombre(data, mat.id)}</span>
         <span className="mt-1.5 flex flex-wrap items-center gap-1.5">
           <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${meta.pill}`}>
-            {i.vista === "aprobada" && s.via === "promocion" ? "Promocionada" : meta.label}
+            {etiqueta(s, i)}
           </span>
           {i.vista === "regular" && (
             <span className="text-[11px] text-sky-700">{i.puedeRendir ? "puede rendir" : "final bloqueado"}</span>
@@ -590,6 +604,8 @@ function Detalle({
   const [nota, setNota] = useState<string>("");
   const [fecha, setFecha] = useState<string>(hoy());
   const [modo, setModo] = useState<null | "regular" | "promocion" | "final" | "libre" | "directa">(null);
+  const [recursaOpen, setRecursaOpen] = useState(false);
+  const [cicloCursado, setCicloCursado] = useState<string>(String(anioActual()));
   const notaNum = nota === "" ? undefined : Number(nota);
   const notaValida = notaNum !== undefined && notaNum >= 1 && notaNum <= 10;
 
@@ -626,6 +642,7 @@ function Detalle({
       const vuelta: Estado = s.via === "promocion" ? "cursando" : s.via === "libre" ? "libre" : s.fechaRegular ? "regular" : "pendiente";
       update({ estado: vuelta, via: undefined, notaFinal: undefined, fechaAprobada: undefined, intentos });
     } else if (s.estado === "regular") update({ estado: "cursando", notaCursada: undefined, fechaRegular: undefined });
+    else if (s.estado === "recursar") update({ estado: "cursando", cicloRecursa: undefined });
     else if (s.estado === "cursando" || s.estado === "libre") update({ estado: "pendiente" });
   };
 
@@ -664,7 +681,9 @@ function Detalle({
             </p>
             <h3 className="font-serif text-xl font-semibold leading-tight">{nombre(data, mat.id)}</h3>
             <span className={`mt-2 inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${meta.pill}`}>
-              {i.vista === "aprobada" && s.via ? `Aprobada · ${s.via === "promocion" ? "promoción" : s.via === "libre" ? "final libre" : "final"}` : meta.label}
+              {i.vista === "aprobada" && s.via
+                ? `Aprobada · ${s.via === "promocion" ? "promoción" : s.via === "libre" ? "final libre" : "final"}`
+                : etiqueta(s, i)}
             </span>
           </div>
           <button onClick={onClose} className="rounded-full px-2 text-2xl leading-none text-neutral-400 hover:text-neutral-800" aria-label="Cerrar">
@@ -732,6 +751,83 @@ function Detalle({
                 <button className={`${btn} bg-rose-600 text-white hover:bg-rose-500`} onClick={() => update({ estado: "libre" })}>
                   Libre
                 </button>
+                <button className={`${btn} bg-orange-500 text-white hover:bg-orange-400`} onClick={() => setRecursaOpen(true)}>
+                  Recursar
+                </button>
+              </div>
+              {recursaOpen && (
+                <div className="mt-3 rounded-xl border border-orange-200 bg-orange-50 p-3">
+                  <p className="mb-2 text-sm text-orange-900">
+                    Recursar: no vas a poder cursarla de nuevo hasta el ciclo lectivo siguiente.
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <label>
+                      Ciclo lectivo que cursaste{" "}
+                      <input
+                        type="number"
+                        min={2000}
+                        max={2100}
+                        value={cicloCursado}
+                        onChange={(e) => setCicloCursado(e.target.value)}
+                        className="ml-1 w-20 rounded-lg border border-neutral-300 px-2 py-1"
+                      />
+                    </label>
+                    <button
+                      className={`${btn} bg-orange-500 text-white hover:bg-orange-400`}
+                      disabled={!/^\d{4}$/.test(cicloCursado)}
+                      onClick={() => {
+                        update({ estado: "recursar", cicloRecursa: Number(cicloCursado) + 1 });
+                        setRecursaOpen(false);
+                      }}
+                    >
+                      Confirmar
+                    </button>
+                    <button className="text-sm text-neutral-500 hover:text-neutral-800" onClick={() => setRecursaOpen(false)}>
+                      Cancelar
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {s.estado === "recursar" && (
+            <div className="space-y-2">
+              {i.vista === "recursar" ? (
+                <p className="rounded-lg bg-orange-50 p-3 text-sm text-orange-900">
+                  Tenés que recursarla. Vas a poder cursarla de nuevo desde el ciclo lectivo <b>{s.cicloRecursa}</b>.
+                </p>
+              ) : !i.puedeCursar ? (
+                <div className="rounded-lg bg-neutral-100 p-3 text-sm text-neutral-700">
+                  <p className="font-medium">Ya empezó el ciclo {s.cicloRecursa}, pero para recursarla te falta:</p>
+                  <ul className="mt-1 list-inside list-disc">
+                    {i.faltaCursar.map((f) => (
+                      <li key={f}>{f}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <p className="text-sm text-orange-900">Ya podés volver a cursarla en el ciclo {s.cicloRecursa}.</p>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  className={`${btn} bg-amber-400 text-amber-950 hover:bg-amber-300`}
+                  disabled={i.vista !== "disponible"}
+                  onClick={() => update({ estado: "cursando", cicloRecursa: undefined })}
+                >
+                  Volver a cursar
+                </button>
+                <label className="text-sm text-neutral-600">
+                  Habilitada desde{" "}
+                  <input
+                    type="number"
+                    min={2000}
+                    max={2100}
+                    value={s.cicloRecursa ?? ""}
+                    onChange={(e) => update({ cicloRecursa: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className="ml-1 w-20 rounded-lg border border-neutral-300 px-2 py-1"
+                  />
+                </label>
               </div>
             </div>
           )}

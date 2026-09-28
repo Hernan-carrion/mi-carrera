@@ -1,5 +1,5 @@
 /**
- * Backend en Google Sheets para "Mi Carrera" (personal-tracker-dashboard).
+ * Backend en Google Sheets para "Mi Carrera" (repo mi-carrera).
  *
  * Instalacion (ver README, seccion "Sincronizar con Google Sheets"):
  *   1. Crear un Google Sheet nuevo -> Extensiones -> Apps Script.

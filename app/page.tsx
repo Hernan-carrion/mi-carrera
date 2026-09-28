@@ -1006,7 +1006,7 @@ function SyncPill({ status, lastSync, onClick }: { status: SyncStatus; lastSync:
   );
 }
 
-const SCRIPT_URL = "https://github.com/Hernan-carrion/personal-tracker-dashboard/blob/main/apps-script/Code.gs";
+const SCRIPT_URL = "https://github.com/Hernan-carrion/mi-carrera/blob/main/apps-script/Code.gs";
 
 function SyncModal({
   cfg,

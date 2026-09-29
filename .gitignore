@@ -36,3 +36,4 @@ next-env.d.ts
 /graphify-out/cache/
 /graphify-out/manifest.json
 /graphify-out/graph.html
+/graphify-out/.graphify_*
